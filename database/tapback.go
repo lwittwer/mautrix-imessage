@@ -104,7 +104,7 @@ func (tapback *Tapback) Insert(txn dbutil.Execable) {
 }
 
 func (tapback *Tapback) Update() {
-	_, err := tapback.db.Exec("UPDATE tapback SET guid=?5, type=?6, emoji=?7, mxid=?8 WHERE portal_guid=?1 AND message_guid=?2 AND message_part=?3 AND sender_guid=?4",
+	_, err := tapback.db.Exec("UPDATE tapback SET guid=$5, type=$6, emoji=$7, mxid=$8 WHERE portal_guid=$1 AND message_guid=$2 AND message_part=$3 AND sender_guid=$4",
 		tapback.PortalGUID, tapback.MessageGUID, tapback.MessagePart, tapback.SenderGUID, tapback.GUID, tapback.Type, tapback.Emoji, tapback.MXID)
 	if err != nil {
 		tapback.log.Warnfln("Failed to update tapback %s/%s.%d/%s: %v", tapback.PortalGUID, tapback.MessageGUID, tapback.MessagePart, tapback.SenderGUID, err)

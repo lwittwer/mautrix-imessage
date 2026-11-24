@@ -56,6 +56,10 @@ type CustomEmojiTapbackAPI interface {
 	SendCustomEmojiTapback(chatID, targetGUID string, targetPart int, emoji string, remove bool) (*SendResponse, error)
 }
 
+type GroupCreationWithMessageAPI interface {
+	CreateGroupWithMessage(guids []string, initialMessage string) (*CreateGroupResponse, error)
+}
+
 type API interface {
 	Start(readyCallback func()) error
 	Stop()

@@ -75,6 +75,21 @@ func newTestConnector(t *testing.T, serverURL string) (*blueBubbles, *fakeBridge
 	return api.(*blueBubbles), fb
 }
 
+var upstreamAllowedReactions = map[string]bool{
+	"love":       true,
+	"like":       true,
+	"dislike":    true,
+	"laugh":      true,
+	"emphasize":  true,
+	"question":   true,
+	"-love":      true,
+	"-like":      true,
+	"-dislike":   true,
+	"-laugh":     true,
+	"-emphasize": true,
+	"-question":  true,
+}
+
 func TestContactConversionAndMatching(t *testing.T) {
 	bb, _ := newTestConnector(t, "http://localhost:1234")
 
@@ -202,7 +217,7 @@ func TestConvertBBMessageEdgeCases(t *testing.T) {
 		t.Fatalf("expected ThreadID to be chat GroupID 'group-uuid-1', got %q", msg.ThreadID)
 	}
 
-	// 3. Custom emoji tapback (numeric 2006 and string -emoji)
+	// 3. Inbound custom emoji tapback add (2006) and remove (3006)
 	var customMsg Message
 	if err := json.Unmarshal([]byte(`{
 		"guid": "tb-1",
@@ -223,6 +238,26 @@ func TestConvertBBMessageEdgeCases(t *testing.T) {
 		t.Fatalf("unexpected custom tapback: %+v", convertedTB.Tapback)
 	}
 
+	var customRemoveMsg Message
+	if err := json.Unmarshal([]byte(`{
+		"guid": "tb-2",
+		"dateCreated": 1700000001500,
+		"chats": [{"guid": "iMessage;-;+15551234567"}],
+		"handle": {"address": "+15551234567", "service": "iMessage"},
+		"associatedMessageGuid": "p:0/msg-1",
+		"associatedMessageType": 3006,
+		"associatedMessageEmoji": "🔥"
+	}`), &customRemoveMsg); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	convertedRemove, err := bb.convertBBMessageToiMessage(customRemoveMsg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if convertedRemove.Tapback == nil || convertedRemove.Tapback.Type != imessage.TapbackCustomEmoji || !convertedRemove.Tapback.Remove || convertedRemove.Tapback.Emoji() != "🔥" {
+		t.Fatalf("unexpected custom tapback removal: %+v", convertedRemove.Tapback)
+	}
+
 	// Non-tapback associatedMessageType (e.g. sticker 1000) should NOT set Tapback
 	nonTB, err := bb.convertBBMessageToiMessage(Message{
 		GUID:                  "sticker-1",
@@ -239,7 +274,7 @@ func TestConvertBBMessageEdgeCases(t *testing.T) {
 	}
 }
 
-func TestSendFileCreateGroupAndCustomEmojiTapback(t *testing.T) {
+func TestSendFileCreateGroupAndTapbacksUpstreamContract(t *testing.T) {
 	var (
 		mu                  sync.Mutex
 		gotFilename         string
@@ -248,6 +283,7 @@ func TestSendFileCreateGroupAndCustomEmojiTapback(t *testing.T) {
 		textMessageCalls    int
 		gotCreateGroupReq   CreateChatRequest
 		gotReactionRequests []SendReactionRequest
+		allowCustomEmoji    atomic.Bool
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -285,6 +321,12 @@ func TestSendFileCreateGroupAndCustomEmojiTapback(t *testing.T) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
+			// Enforce upstream BlueBubbles Private API requirement: non-empty initial message.
+			if req.Method == "private-api" && strings.TrimSpace(req.Message) == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"status":400,"message":"A message is required when using the Private API"}`))
+				return
+			}
 			mu.Lock()
 			gotCreateGroupReq = req
 			mu.Unlock()
@@ -296,6 +338,12 @@ func TestSendFileCreateGroupAndCustomEmojiTapback(t *testing.T) {
 			var req SendReactionRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			// Enforce upstream BlueBubbles validator unless custom emoji server support is simulated.
+			if !allowCustomEmoji.Load() && !upstreamAllowedReactions[req.Reaction] {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"status":400,"message":"Reaction must be one of the 6 valid tapbacks"}`))
 				return
 			}
 			mu.Lock()
@@ -319,7 +367,7 @@ func TestSendFileCreateGroupAndCustomEmojiTapback(t *testing.T) {
 	}
 
 	// Without Private API and empty caption: should preserve real filename and NOT call SendMessage
-	bb.usingPrivateAPI = false
+	bb.usingPrivateAPI.Store(false)
 	resp, err := bb.SendFile("iMessage;-;+15551234567", "", "vacation.png", tmpFile, "", 0, "image/png", false, nil)
 	if err != nil {
 		t.Fatalf("SendFile failed: %v", err)
@@ -338,7 +386,7 @@ func TestSendFileCreateGroupAndCustomEmojiTapback(t *testing.T) {
 	}
 
 	// With Private API and caption: should send subject
-	bb.usingPrivateAPI = true
+	bb.usingPrivateAPI.Store(true)
 	_, err = bb.SendFile("iMessage;-;+15551234567", "look at this", "vacation.png", tmpFile, "", 0, "image/png", false, nil)
 	if err != nil {
 		t.Fatalf("SendFile with private API failed: %v", err)
@@ -347,32 +395,68 @@ func TestSendFileCreateGroupAndCustomEmojiTapback(t *testing.T) {
 		t.Fatalf("expected subject 'look at this', got has=%v val=%q", gotHasSubject, gotSubject)
 	}
 
-	// CreateGroup requires Private API
-	bb.usingPrivateAPI = false
+	// CreateGroup without initial message must return ErrUnsupported
 	if _, err := bb.CreateGroup([]string{"iMessage;-;+15551111111", "iMessage;-;+15552222222"}); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("expected ErrUnsupported for CreateGroup without initial message, got %v", err)
+	}
+
+	// CreateGroupWithMessage requires Private API
+	bb.usingPrivateAPI.Store(false)
+	if _, err := bb.CreateGroupWithMessage([]string{"iMessage;-;+15551111111", "iMessage;-;+15552222222"}, "Hi all"); !errors.Is(err, errors.ErrUnsupported) {
 		t.Fatalf("expected ErrUnsupported without private API, got %v", err)
 	}
 
-	bb.usingPrivateAPI = true
-	grp, err := bb.CreateGroup([]string{"iMessage;-;+15551111111", "iMessage;-;alice@example.com"})
+	// CreateGroupWithMessage rejects blank message before hitting server
+	bb.usingPrivateAPI.Store(true)
+	if _, err := bb.CreateGroupWithMessage([]string{"iMessage;-;+15551111111", "iMessage;-;+15552222222"}, "   "); err == nil {
+		t.Fatal("expected error when initial message is empty")
+	}
+
+	// CreateGroupWithMessage with non-empty message passes upstream validator
+	grp, err := bb.CreateGroupWithMessage([]string{"iMessage;-;+15551111111", "iMessage;-;alice@example.com"}, "Hello group!")
 	if err != nil {
-		t.Fatalf("CreateGroup failed: %v", err)
+		t.Fatalf("CreateGroupWithMessage failed: %v", err)
 	}
 	if grp.GUID != "iMessage;+;chat999" || grp.ThreadID != "grp-999" {
 		t.Fatalf("unexpected CreateGroupResponse: %+v", grp)
 	}
-	if len(gotCreateGroupReq.Addresses) != 2 || gotCreateGroupReq.Addresses[0] != "+15551111111" || gotCreateGroupReq.Addresses[1] != "alice@example.com" || gotCreateGroupReq.Service != "iMessage" {
+	if len(gotCreateGroupReq.Addresses) != 2 || gotCreateGroupReq.Addresses[0] != "+15551111111" || gotCreateGroupReq.Addresses[1] != "alice@example.com" || gotCreateGroupReq.Service != "iMessage" || gotCreateGroupReq.Message != "Hello group!" {
 		t.Fatalf("unexpected CreateChatRequest: %+v", gotCreateGroupReq)
 	}
 
-	// SendCustomEmojiTapback add and remove
+	// Outbound custom emoji tapbacks are gated off by default against upstream BlueBubbles
+	if bb.Capabilities().SendCustomEmojiTapbacks {
+		t.Fatal("expected SendCustomEmojiTapbacks capability to be false by default")
+	}
+	if _, err := bb.SendCustomEmojiTapback("iMessage;-;+15551234567", "msg-1", 0, "🔥", false); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("expected ErrUnsupported for outbound custom emoji by default, got %v", err)
+	}
+
+	// Classic tapbacks add and remove pass upstream validator
+	if _, err := bb.SendTapback("iMessage;-;+15551234567", "msg-1", 0, imessage.TapbackLove, false); err != nil {
+		t.Fatalf("SendTapback add failed: %v", err)
+	}
+	if _, err := bb.SendTapback("iMessage;-;+15551234567", "msg-1", 0, imessage.TapbackLove, true); err != nil {
+		t.Fatalf("SendTapback remove failed: %v", err)
+	}
+
+	// When server explicitly supports custom emoji reactions, gated outbound path works for add & remove
+	allowCustomEmoji.Store(true)
+	bb.supportsCustomEmojiTapbacks.Store(true)
+	if !bb.Capabilities().SendCustomEmojiTapbacks {
+		t.Fatal("expected SendCustomEmojiTapbacks capability to be true when enabled")
+	}
 	if _, err := bb.SendCustomEmojiTapback("iMessage;-;+15551234567", "msg-1", 0, "🔥", false); err != nil {
 		t.Fatalf("SendCustomEmojiTapback add failed: %v", err)
 	}
 	if _, err := bb.SendCustomEmojiTapback("iMessage;-;+15551234567", "msg-1", 0, "🔥", true); err != nil {
 		t.Fatalf("SendCustomEmojiTapback remove failed: %v", err)
 	}
-	if len(gotReactionRequests) != 2 || gotReactionRequests[0].Reaction != "🔥" || gotReactionRequests[1].Reaction != "-🔥" {
+	if len(gotReactionRequests) != 4 ||
+		gotReactionRequests[0].Reaction != "love" ||
+		gotReactionRequests[1].Reaction != "-love" ||
+		gotReactionRequests[2].Reaction != "🔥" ||
+		gotReactionRequests[3].Reaction != "-🔥" {
 		t.Fatalf("unexpected reaction requests: %+v", gotReactionRequests)
 	}
 }
@@ -435,8 +519,10 @@ func TestWebSocketHandshakeEventsAndReconnect(t *testing.T) {
 				return
 			}
 
-			// Send Engine.IO handshake
+			// Send Engine.IO handshake and Socket.IO namespace acceptance ("40")
 			_ = ws.WriteMessage(websocket.TextMessage, []byte(`0{"sid":"abc","pingInterval":25000,"pingTimeout":20000}`))
+			_ = ws.WriteMessage(websocket.TextMessage, []byte(`40{"sid":"ns-abc"}`))
+
 			// Send ping and expect pong "3"
 			_ = ws.WriteMessage(websocket.TextMessage, []byte("2"))
 			_, pong, err := ws.ReadMessage()
@@ -545,5 +631,209 @@ func TestWebSocketHandshakeEventsAndReconnect(t *testing.T) {
 	statuses := fb.getStatuses()
 	if len(statuses) < 3 {
 		t.Fatalf("expected CONNECTED -> TRANSIENT_DISCONNECT -> CONNECTED statuses, got %+v", statuses)
+	}
+}
+
+func TestWebSocketNamespaceRejectionAndTimeout(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
+	// Case 1: Server rejects namespace with "44{...}" -> Start fails and never reports CONNECTED
+	rejectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/server/info":
+			_ = json.NewEncoder(w).Encode(ServerInfoResponse{Status: 200, Data: ServerInfo{PrivateAPI: true}})
+		case "/api/v1/contact":
+			_ = json.NewEncoder(w).Encode(ContactResponse{Status: 200, Data: []Contact{}})
+		case "/socket.io/":
+			ws, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer ws.Close()
+			_, _, _ = ws.ReadMessage()
+			_ = ws.WriteMessage(websocket.TextMessage, []byte(`0{"sid":"abc","pingInterval":25000,"pingTimeout":20000}`))
+			_ = ws.WriteMessage(websocket.TextMessage, []byte(`44{"message":"Invalid password"}`))
+		}
+	}))
+	defer rejectSrv.Close()
+
+	bbReject, fbReject := newTestConnector(t, rejectSrv.URL)
+	bbReject.wsHandshakeTimeout = 500 * time.Millisecond
+	if err := bbReject.Start(func() { t.Error("readyCallback should not be called when namespace is rejected") }); err == nil || !strings.Contains(err.Error(), "namespace rejected") {
+		t.Fatalf("expected namespace rejected error, got %v", err)
+	}
+	for _, st := range fbReject.getStatuses() {
+		if st.StateEvent == "CONNECTED" {
+			t.Fatalf("should not have emitted CONNECTED on namespace rejection: %+v", fbReject.getStatuses())
+		}
+	}
+
+	// Case 2: Server sends Engine.IO open & pings but never sends "40" -> times out and never reports CONNECTED
+	silentSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/server/info":
+			_ = json.NewEncoder(w).Encode(ServerInfoResponse{Status: 200, Data: ServerInfo{PrivateAPI: true}})
+		case "/api/v1/contact":
+			_ = json.NewEncoder(w).Encode(ContactResponse{Status: 200, Data: []Contact{}})
+		case "/socket.io/":
+			ws, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer ws.Close()
+			_, _, _ = ws.ReadMessage()
+			_ = ws.WriteMessage(websocket.TextMessage, []byte(`0{"sid":"abc","pingInterval":25000,"pingTimeout":20000}`))
+			time.Sleep(400 * time.Millisecond)
+		}
+	}))
+	defer silentSrv.Close()
+
+	bbSilent, fbSilent := newTestConnector(t, silentSrv.URL)
+	bbSilent.wsHandshakeTimeout = 100 * time.Millisecond
+	if err := bbSilent.Start(func() { t.Error("readyCallback should not be called on handshake timeout") }); err == nil {
+		t.Fatal("expected timeout error when server never sends namespace ack")
+	}
+	for _, st := range fbSilent.getStatuses() {
+		if st.StateEvent == "CONNECTED" {
+			t.Fatalf("should not have emitted CONNECTED on handshake timeout: %+v", fbSilent.getStatuses())
+		}
+	}
+}
+
+func TestReconnectPrivateAPIRaceAndTransientError(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	var serverInfoCalls atomic.Int32
+	var wsConns atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/server/info":
+			call := serverInfoCalls.Add(1)
+			if call == 2 {
+				// Simulate transient server-info failure on first reconnect; Private API should stay true.
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte("temporary failure"))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(ServerInfoResponse{Status: 200, Data: ServerInfo{PrivateAPI: true}})
+		case "/api/v1/contact":
+			_ = json.NewEncoder(w).Encode(ContactResponse{Status: 200, Data: []Contact{}})
+		case "/api/v1/message/text":
+			_ = json.NewEncoder(w).Encode(SendTextResponse{
+				Status: 200,
+				Data:   Message{GUID: "m-1", DateCreated: 1700000000000},
+			})
+		case "/socket.io/":
+			ws, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer ws.Close()
+			_, _, _ = ws.ReadMessage()
+			_ = ws.WriteMessage(websocket.TextMessage, []byte(`0{"sid":"abc","pingInterval":25000,"pingTimeout":20000}`))
+			_ = ws.WriteMessage(websocket.TextMessage, []byte(`40`))
+			n := wsConns.Add(1)
+			if n == 1 {
+				// Trigger reconnect via "44" namespace error mid-session
+				time.Sleep(20 * time.Millisecond)
+				_ = ws.WriteMessage(websocket.TextMessage, []byte(`44{"message":"session expired"}`))
+				return
+			}
+			for {
+				if _, _, err := ws.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+	bb.reconnectBaseDelay = 15 * time.Millisecond
+	bb.reconnectMaxDelay = 30 * time.Millisecond
+
+	ready := make(chan struct{})
+	if err := bb.Start(func() { close(ready) }); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer bb.Stop()
+	<-ready
+
+	// Concurrently read Capabilities and SendMessage while reconnect runs (verified under -race).
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 40; i++ {
+			_ = bb.Capabilities()
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			_, _ = bb.SendMessage("iMessage;-;+15551234567", "ping", "", 0, nil, nil)
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if wsConns.Load() >= 2 && serverInfoCalls.Load() >= 2 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	wg.Wait()
+
+	if wsConns.Load() < 2 {
+		t.Fatalf("expected reconnect after mid-session 44 error, got %d connections", wsConns.Load())
+	}
+	// Transient HTTP 500 on reconnect's server/info check must NOT clobber confirmed Private API = true.
+	if !bb.Capabilities().SendTapbacks {
+		t.Fatal("expected Private API capability to remain true after transient server/info error on reconnect")
+	}
+}
+
+func TestDroppedEditNotSuppressedWhenBufferFull(t *testing.T) {
+	bb, _ := newTestConnector(t, "http://localhost:1234")
+	// Fill messageChan to capacity so the next enqueue drops.
+	for i := 0; i < cap(bb.messageChan); i++ {
+		bb.messageChan <- &imessage.Message{GUID: "filler"}
+	}
+
+	editPayload := json.RawMessage(`{"guid":"ed-drop","text":"updated text","dateCreated":1700000000000,"dateEdited":1700000005000,"chats":[{"guid":"iMessage;-;+15551234567"}]}`)
+
+	// First attempt drops because messageChan is full; must NOT mark edit timestamp as processed.
+	if err := bb.handleMessageUpdated(editPayload); err != nil {
+		t.Fatalf("handleMessageUpdated failed: %v", err)
+	}
+
+	// Drain the buffer.
+	for i := 0; i < cap(bb.messageChan); i++ {
+		<-bb.messageChan
+	}
+
+	// Repeat of the exact same edit update must now succeed and enqueue.
+	if err := bb.handleMessageUpdated(editPayload); err != nil {
+		t.Fatalf("second handleMessageUpdated failed: %v", err)
+	}
+	select {
+	case msg := <-bb.messageChan:
+		if msg.GUID != "ed-drop" || msg.Text != "updated text" {
+			t.Fatalf("unexpected enqueued edit: %+v", msg)
+		}
+	default:
+		t.Fatal("expected repeated edit after buffer drain to be enqueued, but it was suppressed")
+	}
+
+	// A 3rd identical edit update after successful enqueue SHOULD now be deduplicated.
+	if err := bb.handleMessageUpdated(editPayload); err != nil {
+		t.Fatalf("third handleMessageUpdated failed: %v", err)
+	}
+	select {
+	case msg := <-bb.messageChan:
+		t.Fatalf("expected duplicate edit after enqueue to be suppressed, got %+v", msg)
+	default:
 	}
 }

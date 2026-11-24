@@ -27,6 +27,8 @@ import (
 	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/bridge"
 	"maunium.net/go/mautrix/id"
+
+	"go.mau.fi/mautrix-imessage/database"
 )
 
 var (
@@ -36,6 +38,14 @@ var (
 var _ bridge.DoublePuppet = (*User)(nil)
 
 func (user *User) SwitchCustomMXID(accessToken string, mxid id.UserID) error {
+	if accessToken == "" && (mxid == "" || mxid == user.MXID) {
+		user.clearCustomMXID()
+		user.Update()
+		if user.bridge != nil && user.bridge.DB != nil && user.bridge.DB.KV != nil {
+			user.bridge.DB.KV.Set(database.KVDoublePuppetLoggedOut, "true")
+		}
+		return nil
+	}
 	if mxid != user.MXID {
 		return errors.New("mismatching mxid")
 	}
@@ -45,6 +55,9 @@ func (user *User) SwitchCustomMXID(accessToken string, mxid id.UserID) error {
 		return err
 	}
 	user.Update()
+	if user.bridge != nil && user.bridge.DB != nil && user.bridge.DB.KV != nil {
+		user.bridge.DB.KV.Delete(database.KVDoublePuppetLoggedOut)
+	}
 	return nil
 }
 
@@ -64,6 +77,10 @@ func (user *User) initDoublePuppet() {
 			}
 		}
 	} else if len(user.bridge.Config.Bridge.LoginSharedSecret) > 0 {
+		if user.bridge.DB != nil && user.bridge.DB.KV != nil && user.bridge.DB.KV.Get(database.KVDoublePuppetLoggedOut) == "true" {
+			user.log.Debugln("Skipping shared secret double puppet login because user logged out manually")
+			return
+		}
 		err = user.loginWithSharedSecret()
 		if err == nil {
 			err = user.startCustomMXID()

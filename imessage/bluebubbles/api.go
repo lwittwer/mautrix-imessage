@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -48,6 +49,7 @@ const (
 	defaultMediaHTTPTimeout       = 2 * time.Minute
 	defaultWSReadTimeout          = 90 * time.Second
 	defaultWSWriteTimeout         = 15 * time.Second
+	defaultWSHandshakeTimeout     = 15 * time.Second
 	defaultReconnectBaseDelay     = 1 * time.Second
 	defaultReconnectMaxDelay      = 60 * time.Second
 	defaultContactRefreshInterval = 1 * time.Hour
@@ -55,25 +57,27 @@ const (
 )
 
 var (
-	_ imessage.API                   = (*blueBubbles)(nil)
-	_ imessage.VenturaFeatures       = (*blueBubbles)(nil)
-	_ imessage.CustomEmojiTapbackAPI = (*blueBubbles)(nil)
+	_ imessage.API                         = (*blueBubbles)(nil)
+	_ imessage.VenturaFeatures             = (*blueBubbles)(nil)
+	_ imessage.CustomEmojiTapbackAPI       = (*blueBubbles)(nil)
+	_ imessage.GroupCreationWithMessageAPI = (*blueBubbles)(nil)
 )
 
 type blueBubbles struct {
-	bridge            imessage.Bridge
-	log               zerolog.Logger
-	ws                *websocket.Conn
-	wsMu              sync.Mutex
-	wsWriteLock       sync.Mutex
-	wsReadTimeout     time.Duration
-	messageChan       chan *imessage.Message
-	receiptChan       chan *imessage.ReadReceipt
-	typingChan        chan *imessage.TypingNotification
-	chatChan          chan *imessage.ChatInfo
-	contactChan       chan *imessage.Contact
-	messageStatusChan chan *imessage.SendMessageStatus
-	backfillTaskChan  chan *imessage.BackfillTask
+	bridge             imessage.Bridge
+	log                zerolog.Logger
+	ws                 *websocket.Conn
+	wsMu               sync.Mutex
+	wsWriteLock        sync.Mutex
+	wsReadTimeout      atomic.Int64
+	wsHandshakeTimeout time.Duration
+	messageChan        chan *imessage.Message
+	receiptChan        chan *imessage.ReadReceipt
+	typingChan         chan *imessage.TypingNotification
+	chatChan           chan *imessage.ChatInfo
+	contactChan        chan *imessage.Contact
+	messageStatusChan  chan *imessage.SendMessageStatus
+	backfillTaskChan   chan *imessage.BackfillTask
 
 	contactsLock           sync.RWMutex
 	contactsLastRefresh    time.Time
@@ -93,16 +97,17 @@ type blueBubbles struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	usingPrivateAPI bool
+	usingPrivateAPI             atomic.Bool
+	supportsCustomEmojiTapbacks atomic.Bool
 }
 
 func NewBlueBubblesConnector(bridge imessage.Bridge) (imessage.API, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &blueBubbles{
+	bb := &blueBubbles{
 		bridge: bridge,
 		log:    bridge.GetZLog().With().Str("component", "bluebubbles").Logger(),
 
-		wsReadTimeout: defaultWSReadTimeout,
+		wsHandshakeTimeout: defaultWSHandshakeTimeout,
 
 		messageChan:       make(chan *imessage.Message, 256),
 		receiptChan:       make(chan *imessage.ReadReceipt, 32),
@@ -123,7 +128,9 @@ func NewBlueBubblesConnector(bridge imessage.Bridge) (imessage.API, error) {
 
 		ctx:    ctx,
 		cancel: cancel,
-	}, nil
+	}
+	bb.wsReadTimeout.Store(int64(defaultWSReadTimeout))
+	return bb, nil
 }
 
 func init() {
@@ -159,6 +166,15 @@ func (bb *blueBubbles) sendBridgeState(stateEvent, errCode, message string) {
 	})
 }
 
+func (bb *blueBubbles) refreshPrivateAPI() {
+	enabled, err := bb.fetchPrivateAPI()
+	if err != nil {
+		bb.log.Warn().Err(err).Bool("keepingPrivateAPI", bb.usingPrivateAPI.Load()).Msg("Failed to refresh BlueBubbles server info; keeping previous Private API state")
+		return
+	}
+	bb.usingPrivateAPI.Store(enabled)
+}
+
 func (bb *blueBubbles) Start(readyCallback func()) error {
 	bb.log.Trace().Msg("Start")
 
@@ -167,7 +183,7 @@ func (bb *blueBubbles) Start(readyCallback func()) error {
 	}
 
 	// Preload some caches
-	bb.usingPrivateAPI = bb.isPrivateAPI()
+	bb.refreshPrivateAPI()
 	if err := bb.RefreshContactList(); err != nil {
 		bb.log.Warn().Err(err).Msg("Failed to preload contact list from BlueBubbles")
 	}
@@ -241,13 +257,33 @@ func (bb *blueBubbles) writeWSMessage(messageType int, data []byte) error {
 	return ws.WriteMessage(messageType, data)
 }
 
+func (bb *blueBubbles) applyHandshakePayload(payload []byte) {
+	var hs SocketIOHandshake
+	if err := json.Unmarshal(payload, &hs); err != nil {
+		bb.log.Warn().Err(err).Msg("Failed to parse Socket.IO handshake")
+		return
+	}
+	if hs.PingInterval > 0 || hs.PingTimeout > 0 {
+		timeout := time.Duration(hs.PingInterval+hs.PingTimeout)*time.Millisecond + 15*time.Second
+		if timeout > 0 {
+			bb.wsReadTimeout.Store(int64(timeout))
+		}
+		bb.log.Debug().Int64("pingIntervalMs", hs.PingInterval).Int64("pingTimeoutMs", hs.PingTimeout).Msg("Connected to BlueBubbles Socket.IO")
+	}
+}
+
 func (bb *blueBubbles) connectToWebSocket() (*websocket.Conn, error) {
 	wsURL, err := bb.wsUrl()
 	if err != nil {
 		return nil, err
 	}
+	handshakeTimeout := bb.wsHandshakeTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = defaultWSHandshakeTimeout
+	}
+
 	dialer := *websocket.DefaultDialer
-	dialer.HandshakeTimeout = defaultHTTPTimeout
+	dialer.HandshakeTimeout = handshakeTimeout
 	ws, resp, err := dialer.DialContext(bb.context(), wsURL, nil)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
@@ -255,12 +291,53 @@ func (bb *blueBubbles) connectToWebSocket() (*websocket.Conn, error) {
 		}
 		return nil, err
 	}
-	_ = ws.SetWriteDeadline(time.Now().Add(defaultWSWriteTimeout))
+
+	deadline := time.Now().Add(handshakeTimeout)
+	_ = ws.SetWriteDeadline(deadline)
 	if err := ws.WriteMessage(websocket.TextMessage, []byte("40")); err != nil {
 		_ = ws.Close()
 		return nil, err
 	}
-	return ws, nil
+
+	// Wait for the server's Socket.IO namespace acceptance ("40") within the handshake deadline.
+	for {
+		if err := bb.context().Err(); err != nil {
+			_ = ws.Close()
+			return nil, err
+		}
+		_ = ws.SetReadDeadline(deadline)
+		_, payload, err := ws.ReadMessage()
+		if err != nil {
+			_ = ws.Close()
+			return nil, fmt.Errorf("failed waiting for BlueBubbles Socket.IO namespace acknowledgment: %w", err)
+		}
+
+		switch {
+		case bytes.HasPrefix(payload, []byte("0{")):
+			bb.applyHandshakePayload(payload[1:])
+		case bytes.Equal(payload, []byte("2")):
+			_ = ws.SetWriteDeadline(deadline)
+			if err := ws.WriteMessage(websocket.TextMessage, []byte("3")); err != nil {
+				_ = ws.Close()
+				return nil, fmt.Errorf("failed to write pong during handshake: %w", err)
+			}
+		case bytes.HasPrefix(payload, []byte("2")):
+			_ = ws.SetWriteDeadline(deadline)
+			if err := ws.WriteMessage(websocket.TextMessage, append([]byte("3"), payload[1:]...)); err != nil {
+				_ = ws.Close()
+				return nil, fmt.Errorf("failed to write probe pong during handshake: %w", err)
+			}
+		case bytes.HasPrefix(payload, []byte("40")):
+			bb.log.Debug().Msg("BlueBubbles Socket.IO namespace connected")
+			return ws, nil
+		case bytes.HasPrefix(payload, []byte("44")):
+			_ = ws.Close()
+			return nil, fmt.Errorf("BlueBubbles Socket.IO namespace rejected: %s", strings.TrimSpace(string(payload[2:])))
+		case bytes.HasPrefix(payload, []byte("41")):
+			_ = ws.Close()
+			return nil, errors.New("BlueBubbles websocket disconnected during handshake")
+		}
+	}
 }
 
 func (bb *blueBubbles) wsLoop() {
@@ -289,7 +366,7 @@ func (bb *blueBubbles) pollMessages() error {
 		return errors.New("websocket is not connected")
 	}
 
-	readTimeout := bb.wsReadTimeout
+	readTimeout := time.Duration(bb.wsReadTimeout.Load())
 	if readTimeout <= 0 {
 		readTimeout = defaultWSReadTimeout
 	}
@@ -302,16 +379,7 @@ func (bb *blueBubbles) pollMessages() error {
 
 	// Engine.IO v4 open handshake: 0{"sid":"...","pingInterval":25000,"pingTimeout":20000}
 	if bytes.HasPrefix(payload, []byte("0{")) {
-		var hs SocketIOHandshake
-		if err := json.Unmarshal(payload[1:], &hs); err != nil {
-			bb.log.Warn().Err(err).Msg("Failed to parse Socket.IO handshake")
-		} else if hs.PingInterval > 0 || hs.PingTimeout > 0 {
-			timeout := time.Duration(hs.PingInterval+hs.PingTimeout)*time.Millisecond + 15*time.Second
-			if timeout > 0 {
-				bb.wsReadTimeout = timeout
-			}
-			bb.log.Debug().Int64("pingIntervalMs", hs.PingInterval).Int64("pingTimeoutMs", hs.PingTimeout).Msg("Connected to BlueBubbles Socket.IO")
-		}
+		bb.applyHandshakePayload(payload[1:])
 		return nil
 	}
 
@@ -335,6 +403,11 @@ func (bb *blueBubbles) pollMessages() error {
 	if bytes.HasPrefix(payload, []byte("40")) {
 		bb.log.Debug().Msg("BlueBubbles Socket.IO namespace connected")
 		return nil
+	}
+
+	// Socket.IO v4 namespace connect error ("44...")
+	if bytes.HasPrefix(payload, []byte("44")) {
+		return fmt.Errorf("BlueBubbles Socket.IO namespace error: %s", strings.TrimSpace(string(payload[2:])))
 	}
 
 	// Socket.IO v4 namespace disconnect ("41...")
@@ -471,7 +544,7 @@ func (bb *blueBubbles) reconnect() bool {
 		}
 
 		bb.setWS(ws)
-		bb.usingPrivateAPI = bb.isPrivateAPI()
+		bb.refreshPrivateAPI()
 		bb.sendBridgeState("CONNECTED", "", "")
 		bb.log.Info().Int("attempt", attempt).Msg("Successfully reconnected to BlueBubbles WebSocket")
 		return true
@@ -493,9 +566,21 @@ func (bb *blueBubbles) stopListening() {
 	}
 }
 
-func (bb *blueBubbles) recordEdited(guid string, dateEdited int64) bool {
+func (bb *blueBubbles) isNewEdit(guid string, dateEdited int64) bool {
 	if guid == "" || dateEdited == 0 {
 		return false
+	}
+	bb.editedLock.Lock()
+	defer bb.editedLock.Unlock()
+	if prev, ok := bb.lastEdited[guid]; ok && dateEdited <= prev {
+		return false
+	}
+	return true
+}
+
+func (bb *blueBubbles) markEdited(guid string, dateEdited int64) {
+	if guid == "" || dateEdited == 0 {
+		return
 	}
 	bb.editedLock.Lock()
 	defer bb.editedLock.Unlock()
@@ -503,13 +588,12 @@ func (bb *blueBubbles) recordEdited(guid string, dateEdited int64) bool {
 		bb.lastEdited = make(map[string]int64)
 	}
 	if prev, ok := bb.lastEdited[guid]; ok && dateEdited <= prev {
-		return false
+		return
 	}
 	if len(bb.lastEdited) >= maxTrackedEditedMessages {
 		bb.lastEdited = make(map[string]int64)
 	}
 	bb.lastEdited[guid] = dateEdited
-	return true
 }
 
 func (bb *blueBubbles) handleNewMessage(rawMessage json.RawMessage) (err error) {
@@ -529,12 +613,11 @@ func (bb *blueBubbles) handleNewMessage(rawMessage json.RawMessage) (err error) 
 		return err
 	}
 
-	if data.DateEdited != 0 {
-		bb.recordEdited(data.GUID, data.DateEdited)
-	}
-
 	select {
 	case bb.messageChan <- message:
+		if data.DateEdited != 0 {
+			bb.markEdited(data.GUID, data.DateEdited)
+		}
 	default:
 		bb.log.Warn().Msg("Incoming message buffer is full")
 	}
@@ -624,10 +707,13 @@ func (bb *blueBubbles) handleMessageUpdated(rawMessage json.RawMessage) (err err
 		return err
 	}
 
-	isNewEdit := message.IsEdited && bb.recordEdited(data.GUID, data.DateEdited)
+	isNewEdit := message.IsEdited && bb.isNewEdit(data.GUID, data.DateEdited)
 	if isNewEdit || message.IsRetracted {
 		select {
 		case bb.messageChan <- message:
+			if isNewEdit {
+				bb.markEdited(data.GUID, data.DateEdited)
+			}
 		default:
 			bb.log.Warn().Msg("Incoming message buffer is full")
 		}
@@ -1400,8 +1486,9 @@ func buildSendResponse(chatID string, msg Message) *imessage.SendResponse {
 func (bb *blueBubbles) SendMessage(chatID, text string, replyTo string, replyToPart int, richLink *imessage.RichLink, metadata imessage.MessageMetadata) (*imessage.SendResponse, error) {
 	bb.log.Trace().Str("chatID", chatID).Str("text", text).Str("replyTo", replyTo).Int("replyToPart", replyToPart).Any("richLink", richLink).Interface("metadata", metadata).Msg("SendMessage")
 
+	privateAPI := bb.usingPrivateAPI.Load()
 	var method string
-	if bb.usingPrivateAPI {
+	if privateAPI {
 		method = "private-api"
 	} else {
 		// we have to use apple-script and send a second message
@@ -1438,7 +1525,7 @@ func (bb *blueBubbles) SendMessage(chatID, text string, replyTo string, replyToP
 func (bb *blueBubbles) UnsendMessage(chatID, targetGUID string, targetPart int) (*imessage.SendResponse, error) {
 	bb.log.Trace().Str("chatID", chatID).Str("targetGUID", targetGUID).Int("targetPart", targetPart).Msg("UnsendMessage")
 
-	if !bb.usingPrivateAPI {
+	if !bb.usingPrivateAPI.Load() {
 		bb.log.Warn().Str("chatID", chatID).Str("targetGUID", targetGUID).Int("targetPart", targetPart).Msg("The private-api isn't enabled in BlueBubbles, can't unsend message")
 		return nil, errors.ErrUnsupported
 	}
@@ -1466,7 +1553,7 @@ func (bb *blueBubbles) UnsendMessage(chatID, targetGUID string, targetPart int) 
 func (bb *blueBubbles) EditMessage(chatID string, targetGUID string, newText string, targetPart int) (*imessage.SendResponse, error) {
 	bb.log.Trace().Str("chatID", chatID).Str("targetGUID", targetGUID).Str("newText", newText).Int("targetPart", targetPart).Msg("EditMessage")
 
-	if !bb.usingPrivateAPI {
+	if !bb.usingPrivateAPI.Load() {
 		bb.log.Warn().Str("chatID", chatID).Str("targetGUID", targetGUID).Str("newText", newText).Int("targetPart", targetPart).Msg("The private-api isn't enabled in BlueBubbles, can't edit message")
 		return nil, errors.ErrUnsupported
 	}
@@ -1493,15 +1580,13 @@ func (bb *blueBubbles) EditMessage(chatID string, targetGUID string, newText str
 	return buildSendResponse(chatID, res.Data), nil
 }
 
-func (bb *blueBubbles) isPrivateAPI() bool {
+func (bb *blueBubbles) fetchPrivateAPI() (bool, error) {
 	var serverInfo ServerInfoResponse
 	err := bb.apiGet("/api/v1/server/info", nil, &serverInfo)
 	if err != nil {
-		bb.log.Error().Err(err).Msg("Failed to get server info from BlueBubbles")
-		return false
+		return false, err
 	}
-
-	return serverInfo.Data.PrivateAPI
+	return serverInfo.Data.PrivateAPI, nil
 }
 
 func (bb *blueBubbles) SendFile(chatID, text, filename string, pathOnDisk string, replyTo string, replyToPart int, mimeType string, voiceMemo bool, metadata imessage.MessageMetadata) (*imessage.SendResponse, error) {
@@ -1521,8 +1606,10 @@ func (bb *blueBubbles) SendFile(chatID, text, filename string, pathOnDisk string
 
 	bb.log.Info().Int("attachmentSize", len(attachment)).Str("filename", filename).Msg("Read attachment from disk")
 
+	// Snapshot Private API mode once so method, subject, and fallback caption stay consistent.
+	privateAPI := bb.usingPrivateAPI.Load()
 	var method string
-	if bb.usingPrivateAPI {
+	if privateAPI {
 		method = "private-api"
 	} else {
 		// we have to use apple-script and send a second message if there's a caption
@@ -1543,7 +1630,7 @@ func (bb *blueBubbles) SendFile(chatID, text, filename string, pathOnDisk string
 		formData["partIndex"] = replyToPart
 	}
 
-	if bb.usingPrivateAPI && text != "" {
+	if privateAPI && text != "" {
 		formData["subject"] = text
 	}
 
@@ -1559,7 +1646,7 @@ func (bb *blueBubbles) SendFile(chatID, text, filename string, pathOnDisk string
 		return nil, fmt.Errorf("could not send attachment (status %d: %s)", response.Status, response.Message)
 	}
 
-	if !bb.usingPrivateAPI && text != "" {
+	if !privateAPI && text != "" {
 		if _, err := bb.SendMessage(chatID, text, replyTo, replyToPart, nil, nil); err != nil {
 			bb.log.Warn().Err(err).Str("chatID", chatID).Msg("Failed to send caption text after attachment")
 		}
@@ -1573,7 +1660,7 @@ func (bb *blueBubbles) SendFileCleanup(sendFileDir string) {
 }
 
 func (bb *blueBubbles) sendReaction(chatID, targetGUID string, targetPart int, reaction string, remove bool) (*imessage.SendResponse, error) {
-	if !bb.usingPrivateAPI {
+	if !bb.usingPrivateAPI.Load() {
 		bb.log.Warn().Str("chatID", chatID).Str("targetGUID", targetGUID).Str("reaction", reaction).Bool("remove", remove).Msg("The private-api isn't enabled in BlueBubbles, can't send tapback")
 		return nil, errors.ErrUnsupported
 	}
@@ -1615,13 +1702,16 @@ func (bb *blueBubbles) SendTapback(chatID, targetGUID string, targetPart int, ta
 
 func (bb *blueBubbles) SendCustomEmojiTapback(chatID, targetGUID string, targetPart int, emoji string, remove bool) (*imessage.SendResponse, error) {
 	bb.log.Trace().Str("chatID", chatID).Str("targetGUID", targetGUID).Int("targetPart", targetPart).Str("emoji", emoji).Bool("remove", remove).Msg("SendCustomEmojiTapback")
+	if !bb.supportsCustomEmojiTapbacks.Load() {
+		return nil, fmt.Errorf("%w: BlueBubbles server /api/v1/message/react does not support custom emoji reactions", errors.ErrUnsupported)
+	}
 	return bb.sendReaction(chatID, targetGUID, targetPart, emoji, remove)
 }
 
 func (bb *blueBubbles) SendReadReceipt(chatID, readUpTo string) error {
 	bb.log.Trace().Str("chatID", chatID).Str("readUpTo", readUpTo).Msg("SendReadReceipt")
 
-	if !bb.usingPrivateAPI {
+	if !bb.usingPrivateAPI.Load() {
 		bb.log.Warn().Str("chatID", chatID).Msg("The private-api isn't enabled in BlueBubbles, can't send read receipt")
 		return errors.ErrUnsupported
 	}
@@ -1647,7 +1737,7 @@ func (bb *blueBubbles) SendReadReceipt(chatID, readUpTo string) error {
 func (bb *blueBubbles) SendTypingNotification(chatID string, typing bool) error {
 	bb.log.Trace().Str("chatID", chatID).Bool("typing", typing).Msg("SendTypingNotification")
 
-	if !bb.usingPrivateAPI {
+	if !bb.usingPrivateAPI.Load() {
 		bb.log.Warn().Str("chatID", chatID).Bool("typing", typing).Msg("The private-api isn't enabled in BlueBubbles, can't send typing notification")
 		return errors.ErrUnsupported
 	}
@@ -1707,13 +1797,22 @@ func (bb *blueBubbles) PrepareDM(guid string) error {
 
 func (bb *blueBubbles) CreateGroup(users []string) (*imessage.CreateGroupResponse, error) {
 	bb.log.Trace().Interface("users", users).Msg("CreateGroup")
+	return nil, fmt.Errorf("%w: BlueBubbles requires a non-empty initial message to create a group chat", errors.ErrUnsupported)
+}
 
-	if !bb.usingPrivateAPI {
+func (bb *blueBubbles) CreateGroupWithMessage(users []string, initialMessage string) (*imessage.CreateGroupResponse, error) {
+	bb.log.Trace().Interface("users", users).Msg("CreateGroupWithMessage")
+
+	if !bb.usingPrivateAPI.Load() {
 		bb.log.Warn().Interface("users", users).Msg("The private-api isn't enabled in BlueBubbles, can't create group")
 		return nil, errors.ErrUnsupported
 	}
 	if len(users) == 0 {
 		return nil, errors.New("at least one participant is required to create a group")
+	}
+	trimmedMsg := strings.TrimSpace(initialMessage)
+	if trimmedMsg == "" {
+		return nil, errors.New("initial message is required to create a group chat in BlueBubbles")
 	}
 
 	service := "iMessage"
@@ -1741,6 +1840,7 @@ func (bb *blueBubbles) CreateGroup(users []string) (*imessage.CreateGroupRespons
 		Addresses: addresses,
 		Service:   service,
 		Method:    "private-api",
+		Message:   trimmedMsg,
 		TempGUID:  fmt.Sprintf("temp-%s", RandString(8)),
 	}
 
@@ -2420,18 +2520,19 @@ func (bb *blueBubbles) PostStartupSyncHook() {
 }
 
 func (bb *blueBubbles) Capabilities() imessage.ConnectorCapabilities {
+	privateAPI := bb.usingPrivateAPI.Load()
 	return imessage.ConnectorCapabilities{
 		MessageSendResponses:     true,
-		SendTapbacks:             bb.usingPrivateAPI,
-		SendCustomEmojiTapbacks:  bb.usingPrivateAPI,
-		UnsendMessages:           bb.usingPrivateAPI,
-		EditMessages:             bb.usingPrivateAPI,
-		SendReadReceipts:         bb.usingPrivateAPI,
-		SendTypingNotifications:  bb.usingPrivateAPI,
+		SendTapbacks:             privateAPI,
+		SendCustomEmojiTapbacks:  privateAPI && bb.supportsCustomEmojiTapbacks.Load(),
+		UnsendMessages:           privateAPI,
+		EditMessages:             privateAPI,
+		SendReadReceipts:         privateAPI,
+		SendTypingNotifications:  privateAPI,
 		SendCaptions:             true,
 		BridgeState:              true,
 		MessageStatusCheckpoints: false,
-		DeliveredStatus:          bb.usingPrivateAPI,
+		DeliveredStatus:          privateAPI,
 		ContactChatMerging:       false,
 		RichLinks:                false,
 		ChatBridgeResult:         false,

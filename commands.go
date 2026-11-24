@@ -17,6 +17,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -191,23 +192,51 @@ var cmdCreateGroup = &commands.FullHandler{
 	Name: "create-group",
 	Help: commands.HelpMeta{
 		Section:     HelpSectionManagingPortals,
-		Description: "Creates a new group chat with the specified phone numbers or email addresses.",
-		Args:        "<_address1_> <_address2_> [...]",
+		Description: "Creates a new group chat with the specified phone numbers or email addresses (and initial message for BlueBubbles).",
+		Args:        "<_address1_> <_address2_> [...] [-- <_initial message_>]",
 	},
 	RequiresPortal: false,
 	RequiresLogin:  false,
 }
 
+func parseCreateGroupArgs(rawArgs string) (addresses []string, initialMessage string) {
+	trimmed := strings.TrimSpace(rawArgs)
+	if trimmed == "" {
+		return nil, ""
+	}
+	// Split on standalone "--" separator to preserve spacing in the initial message.
+	var addrPart string
+	if idx := strings.Index(trimmed, " -- "); idx >= 0 {
+		addrPart = trimmed[:idx]
+		initialMessage = strings.TrimSpace(trimmed[idx+4:])
+	} else if strings.HasSuffix(trimmed, " --") {
+		addrPart = strings.TrimSuffix(trimmed, " --")
+	} else if trimmed == "--" {
+		return nil, ""
+	} else {
+		addrPart = trimmed
+	}
+	addresses = strings.Fields(addrPart)
+	return addresses, initialMessage
+}
+
 func fnCreateGroup(ce *WrappedCommandEvent) {
 	ce.Bridge.ZLog.Trace().Interface("args", ce.Args).Str("cmd", ce.Command).Msg("fnCreateGroup")
 
-	if len(ce.Args) < 2 {
-		ce.Reply("**Usage:** `create-group <address1> <address2> [...]`")
+	addresses, initialMessage := parseCreateGroupArgs(ce.RawArgs)
+	withMsgAPI, needsInitialMessage := ce.Bridge.IM.(imessage.GroupCreationWithMessageAPI)
+
+	if len(addresses) < 2 || (needsInitialMessage && initialMessage == "") {
+		if needsInitialMessage {
+			ce.Reply("**Usage:** `create-group <address1> <address2> [...] -- <initial message>`")
+		} else {
+			ce.Reply("**Usage:** `create-group <address1> <address2> [...]`")
+		}
 		return
 	}
 
-	guids := make([]string, len(ce.Args))
-	for i, identifier := range ce.Args {
+	guids := make([]string, len(addresses))
+	for i, identifier := range addresses {
 		if strings.HasPrefix(identifier, "iMessage;-;") || strings.HasPrefix(identifier, "SMS;-;") {
 			guids[i] = identifier
 		} else {
@@ -220,7 +249,13 @@ func fnCreateGroup(ce *WrappedCommandEvent) {
 		}
 	}
 
-	createResp, err := ce.Bridge.IM.CreateGroup(guids)
+	var createResp *imessage.CreateGroupResponse
+	var err error
+	if needsInitialMessage {
+		createResp, err = withMsgAPI.CreateGroupWithMessage(guids, initialMessage)
+	} else {
+		createResp, err = ce.Bridge.IM.CreateGroup(guids)
+	}
 	if err != nil {
 		ce.Reply("Failed to create group: %s", err)
 		return
@@ -241,7 +276,7 @@ var cmdSync = &commands.FullHandler{
 	Name: "sync",
 	Help: commands.HelpMeta{
 		Section:     HelpSectionManagingPortals,
-		Description: "Refreshes contacts and resyncs existing portal rooms and metadata.",
+		Description: "Refreshes contacts and attempts to resync existing portal rooms and metadata.",
 	},
 	RequiresPortal: false,
 	RequiresLogin:  false,
@@ -250,17 +285,25 @@ var cmdSync = &commands.FullHandler{
 func fnSync(ce *WrappedCommandEvent) {
 	ce.Bridge.ZLog.Trace().Str("cmd", ce.Command).Msg("fnSync")
 
+	var contactStatus string
 	if err := ce.Bridge.IM.RefreshContactList(); err != nil {
-		ce.Bridge.ZLog.Warn().Err(err).Msg("Failed to refresh contact list during manual sync")
+		if errors.Is(err, errors.ErrUnsupported) {
+			contactStatus = "Contact list refresh is not supported by this connector."
+		} else {
+			ce.Bridge.ZLog.Warn().Err(err).Msg("Failed to refresh contact list during manual sync")
+			contactStatus = fmt.Sprintf("Failed to refresh contact list: %s.", err)
+		}
+	} else {
+		contactStatus = "Contact list refreshed."
 	}
 
 	portals := ce.Bridge.GetAllPortals()
-	synced := 0
+	attempted := 0
 	for _, portal := range portals {
 		if len(portal.MXID) > 0 {
 			portal.Sync(false)
-			synced++
+			attempted++
 		}
 	}
-	ce.Reply("Contact list refreshed and synced %d portal rooms.", synced)
+	ce.Reply("%s Attempted sync for %d portal rooms.", contactStatus, attempted)
 }
