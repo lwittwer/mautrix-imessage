@@ -94,10 +94,15 @@ type blueBubbles struct {
 	reconnectBaseDelay time.Duration
 	reconnectMaxDelay  time.Duration
 
+	ctxMu  sync.RWMutex
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	usingPrivateAPI             atomic.Bool
+	usingPrivateAPI atomic.Bool
+	// Outbound custom emoji tapbacks are intentionally gated off by default as
+	// groundwork until upstream BlueBubbles Server's /api/v1/message/react
+	// validator accepts custom emoji. Inbound 2006/3006 custom emoji reactions
+	// remain active regardless of this flag.
 	supportsCustomEmojiTapbacks atomic.Bool
 }
 
@@ -138,8 +143,11 @@ func init() {
 }
 
 func (bb *blueBubbles) context() context.Context {
-	if bb.ctx != nil {
-		return bb.ctx
+	bb.ctxMu.RLock()
+	ctx := bb.ctx
+	bb.ctxMu.RUnlock()
+	if ctx != nil {
+		return ctx
 	}
 	return context.Background()
 }
@@ -178,9 +186,11 @@ func (bb *blueBubbles) refreshPrivateAPI() {
 func (bb *blueBubbles) Start(readyCallback func()) error {
 	bb.log.Trace().Msg("Start")
 
+	bb.ctxMu.Lock()
 	if bb.ctx == nil || bb.ctx.Err() != nil {
 		bb.ctx, bb.cancel = context.WithCancel(context.Background())
 	}
+	bb.ctxMu.Unlock()
 
 	// Preload some caches
 	bb.refreshPrivateAPI()
@@ -207,8 +217,11 @@ func (bb *blueBubbles) Start(readyCallback func()) error {
 
 func (bb *blueBubbles) Stop() {
 	bb.log.Trace().Msg("Stop")
-	if bb.cancel != nil {
-		bb.cancel()
+	bb.ctxMu.RLock()
+	cancel := bb.cancel
+	bb.ctxMu.RUnlock()
+	if cancel != nil {
+		cancel()
 	}
 	bb.stopListening()
 }
@@ -1253,8 +1266,14 @@ func (bb *blueBubbles) matchHandleToContact(address string) *Contact {
 					contact = &copied
 					break
 				}
-				if len(numericPhone) >= 7 && len(numericPhone) <= 15 &&
-					(strings.HasSuffix(numericAddress, numericPhone) || strings.HasSuffix(numericPhone, numericAddress)) {
+				if len(numericPhone) >= 7 && len(numericPhone) <= 15 && strings.HasSuffix(numericAddress, numericPhone) {
+					copied := c
+					contact = &copied
+					break
+				}
+				// Require at least 10 digits on the incoming address for reverse suffix matching
+				// so SMS short codes (e.g. 262966) don't falsely match contacts' phone numbers.
+				if len(numericAddress) >= 10 && len(numericAddress) <= 15 && strings.HasSuffix(numericPhone, numericAddress) {
 					copied := c
 					contact = &copied
 					break
@@ -1575,6 +1594,13 @@ func (bb *blueBubbles) EditMessage(chatID string, targetGUID string, newText str
 	if res.Status != 200 {
 		bb.log.Error().Int64("statusCode", res.Status).Any("response", res).Msg("Failure when editing message in BlueBubbles")
 		return nil, fmt.Errorf("could not edit message (status %d: %s)", res.Status, res.Message)
+	}
+
+	// Mark this edit timestamp as already processed so BlueBubbles's updated-message echo
+	// does not bridge our own Matrix edit back as a duplicate m.replace event.
+	bb.markEdited(targetGUID, res.Data.DateEdited)
+	if res.Data.GUID != "" && res.Data.GUID != targetGUID {
+		bb.markEdited(res.Data.GUID, res.Data.DateEdited)
 	}
 
 	return buildSendResponse(chatID, res.Data), nil

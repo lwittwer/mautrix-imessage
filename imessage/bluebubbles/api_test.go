@@ -138,11 +138,28 @@ func TestContactConversionAndMatching(t *testing.T) {
 			SourceType:   "db",
 			PhoneNumbers: []PhoneNumber{{Address: "+1 555-123-4567"}},
 		},
+		{
+			FirstName:    "ShortCode",
+			LastName:     "Target",
+			SourceType:   "db",
+			PhoneNumbers: []PhoneNumber{{Address: "+1 (555) 126-2966"}},
+		},
 	}
 
 	matched := bb.matchHandleToContact("+15551234567")
 	if matched == nil || matched.FirstName != "DB" {
 		t.Fatalf("expected DB contact to win over API contact, got %+v", matched)
+	}
+
+	// 10-digit national number without country code should still match +1-prefixed contact.
+	matchedLocal := bb.matchHandleToContact("5551234567")
+	if matchedLocal == nil || matchedLocal.FirstName != "DB" {
+		t.Fatalf("expected 10-digit local number to match +1 contact, got %+v", matchedLocal)
+	}
+
+	// SMS short code (e.g. 262966) must NOT falsely match a contact whose number ends in 262966.
+	if shortCodeMatch := bb.matchHandleToContact("262966"); shortCodeMatch != nil {
+		t.Fatalf("expected short-code sender '262966' not to match any contact, got %+v", shortCodeMatch)
 	}
 
 	matchedEmail := bb.matchHandleToContact("alice@example.com")
@@ -835,5 +852,58 @@ func TestDroppedEditNotSuppressedWhenBufferFull(t *testing.T) {
 	case msg := <-bb.messageChan:
 		t.Fatalf("expected duplicate edit after enqueue to be suppressed, got %+v", msg)
 	default:
+	}
+}
+
+func TestEditMessageSuppressesOwnEcho(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/message/msg-edit-1/edit" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(EditMessageResponse{
+			Status: 200,
+			Data: Message{
+				GUID:        "msg-edit-1",
+				DateCreated: 1700000000000,
+				DateEdited:  1700000010000,
+				IsFromMe:    true,
+				Text:        "fixed typo",
+				Chats:       []Chat{{GUID: "iMessage;-;+15551234567"}},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+	bb.usingPrivateAPI.Store(true)
+
+	if _, err := bb.EditMessage("iMessage;-;+15551234567", "msg-edit-1", "fixed typo", 0); err != nil {
+		t.Fatalf("EditMessage failed: %v", err)
+	}
+
+	// BlueBubbles echoes back an updated-message event with the same dateEdited: must NOT emit to messageChan.
+	sameEcho := json.RawMessage(`{"guid":"msg-edit-1","isFromMe":true,"text":"fixed typo","dateCreated":1700000000000,"dateEdited":1700000010000,"chats":[{"guid":"iMessage;-;+15551234567"}]}`)
+	if err := bb.handleMessageUpdated(sameEcho); err != nil {
+		t.Fatalf("handleMessageUpdated echo failed: %v", err)
+	}
+	select {
+	case msg := <-bb.messageChan:
+		t.Fatalf("expected own Matrix edit echo to be suppressed, got %+v", msg)
+	default:
+	}
+
+	// A subsequent edit from another Apple device with a newer dateEdited SHOULD still be bridged.
+	newerEdit := json.RawMessage(`{"guid":"msg-edit-1","isFromMe":true,"text":"edited again on phone","dateCreated":1700000000000,"dateEdited":1700000020000,"chats":[{"guid":"iMessage;-;+15551234567"}]}`)
+	if err := bb.handleMessageUpdated(newerEdit); err != nil {
+		t.Fatalf("handleMessageUpdated newer edit failed: %v", err)
+	}
+	select {
+	case msg := <-bb.messageChan:
+		if msg.Text != "edited again on phone" || !msg.IsEdited {
+			t.Fatalf("unexpected newer edit message: %+v", msg)
+		}
+	default:
+		t.Fatal("expected newer edit from another device to reach messageChan")
 	}
 }

@@ -261,14 +261,32 @@ func fnCreateGroup(ce *WrappedCommandEvent) {
 		return
 	}
 
-	portal := ce.Bridge.GetPortalByGUID(createResp.GUID)
-	portal.ThreadID = createResp.ThreadID
-	if err = portal.CreateMatrixRoom(nil, nil); err != nil {
-		ce.Reply("Created iMessage group `%s`, but failed to create Matrix room: %s", createResp.GUID, err)
-		return
+	var initialMsgWarning string
+	if !needsInitialMessage && initialMessage != "" {
+		if _, sendErr := ce.Bridge.IM.SendMessage(createResp.GUID, initialMessage, "", 0, nil, nil); sendErr != nil {
+			initialMsgWarning = fmt.Sprintf(" (failed to send initial message: %s)", sendErr)
+		}
 	}
 
-	ce.Reply("Created group portal room [%s](%s) and invited you to it.", portal.MXID, portal.MXID.URI(ce.Bridge.Config.Homeserver.Domain).MatrixToURL())
+	portal := ce.Bridge.GetPortalByGUID(createResp.GUID)
+	portal.roomCreateLock.Lock()
+	alreadyExists := len(portal.MXID) > 0
+	if !alreadyExists && createResp.ThreadID != "" {
+		portal.ThreadID = createResp.ThreadID
+	}
+	roomID := portal.MXID
+	portal.roomCreateLock.Unlock()
+
+	if !alreadyExists {
+		if err = portal.CreateMatrixRoom(nil, nil); err != nil {
+			ce.Reply("Created iMessage group `%s`, but failed to create Matrix room: %s", createResp.GUID, err)
+			return
+		}
+		roomID = portal.MXID
+		ce.Reply("Created group portal room [%s](%s) and invited you to it.%s", roomID, roomID.URI(ce.Bridge.Config.Homeserver.Domain).MatrixToURL(), initialMsgWarning)
+	} else {
+		ce.Reply("Group portal room [%s](%s) already exists.%s", roomID, roomID.URI(ce.Bridge.Config.Homeserver.Domain).MatrixToURL(), initialMsgWarning)
+	}
 }
 
 var cmdSync = &commands.FullHandler{
@@ -285,25 +303,27 @@ var cmdSync = &commands.FullHandler{
 func fnSync(ce *WrappedCommandEvent) {
 	ce.Bridge.ZLog.Trace().Str("cmd", ce.Command).Msg("fnSync")
 
-	var contactStatus string
-	if err := ce.Bridge.IM.RefreshContactList(); err != nil {
-		if errors.Is(err, errors.ErrUnsupported) {
-			contactStatus = "Contact list refresh is not supported by this connector."
+	go func() {
+		var contactStatus string
+		if err := ce.Bridge.IM.RefreshContactList(); err != nil {
+			if errors.Is(err, errors.ErrUnsupported) {
+				contactStatus = "Contact list refresh is not supported by this connector."
+			} else {
+				ce.Bridge.ZLog.Warn().Err(err).Msg("Failed to refresh contact list during manual sync")
+				contactStatus = fmt.Sprintf("Failed to refresh contact list: %s.", err)
+			}
 		} else {
-			ce.Bridge.ZLog.Warn().Err(err).Msg("Failed to refresh contact list during manual sync")
-			contactStatus = fmt.Sprintf("Failed to refresh contact list: %s.", err)
+			contactStatus = "Contact list refreshed."
 		}
-	} else {
-		contactStatus = "Contact list refreshed."
-	}
 
-	portals := ce.Bridge.GetAllPortals()
-	attempted := 0
-	for _, portal := range portals {
-		if len(portal.MXID) > 0 {
-			portal.Sync(false)
-			attempted++
+		portals := ce.Bridge.GetAllPortals()
+		attempted := 0
+		for _, portal := range portals {
+			if len(portal.MXID) > 0 {
+				portal.Sync(false)
+				attempted++
+			}
 		}
-	}
-	ce.Reply("%s Attempted sync for %d portal rooms.", contactStatus, attempted)
+		ce.Reply("%s Attempted sync for %d portal rooms.", contactStatus, attempted)
+	}()
 }
