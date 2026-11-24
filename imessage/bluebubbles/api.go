@@ -797,15 +797,9 @@ func (bb *blueBubbles) handleMessageUpdated(rawMessage json.RawMessage) (err err
 		return err
 	}
 
-	message, err := bb.convertBBMessageToiMessage(data)
-
-	if err != nil {
-		bb.log.Warn().Err(err).RawJSON("rawMessage", rawMessage).Str("event", "handleMessageUpdated").Msg("Failed to convert message data")
-		return err
-	}
-
+	isRetracted := data.DateRetracted != 0
 	isNewEdit := false
-	if message.IsEdited {
+	if data.DateEdited != 0 {
 		if bb.consumePendingEdit(data.GUID, data.Text) {
 			// Echo of our own Matrix-initiated edit (arrived before HTTP response or without dateEdited in response).
 			bb.markEdited(data.GUID, data.DateEdited)
@@ -813,6 +807,16 @@ func (bb *blueBubbles) handleMessageUpdated(rawMessage json.RawMessage) (err err
 			isNewEdit = bb.isNewEdit(data.GUID, data.DateEdited)
 		}
 	}
+
+	// Only download attachments when forwarding a genuine new edit; delivery/read/retract
+	// updates and suppressed echoes do not need media fetched to disk.
+	downloadAttachments := isNewEdit && !isRetracted
+	message, err := bb.convertBBMessageToiMessageWithOptions(data, downloadAttachments)
+	if err != nil {
+		bb.log.Warn().Err(err).RawJSON("rawMessage", rawMessage).Str("event", "handleMessageUpdated").Msg("Failed to convert message data")
+		return err
+	}
+
 	if isNewEdit || message.IsRetracted {
 		select {
 		case bb.messageChan <- message:
@@ -820,6 +824,11 @@ func (bb *blueBubbles) handleMessageUpdated(rawMessage json.RawMessage) (err err
 				bb.markEdited(data.GUID, data.DateEdited)
 			}
 		default:
+			for _, att := range message.Attachments {
+				if att != nil && att.PathOnDisk != "" {
+					_ = os.Remove(att.PathOnDisk)
+				}
+			}
 			bb.log.Warn().Msg("Incoming message buffer is full")
 		}
 	} else if message.IsRead {
@@ -2445,6 +2454,10 @@ func parseThreadOriginatorPart(part string) (int, error) {
 }
 
 func (bb *blueBubbles) convertBBMessageToiMessage(bbMessage Message) (*imessage.Message, error) {
+	return bb.convertBBMessageToiMessageWithOptions(bbMessage, true)
+}
+
+func (bb *blueBubbles) convertBBMessageToiMessageWithOptions(bbMessage Message, downloadAttachments bool) (*imessage.Message, error) {
 	if len(bbMessage.Chats) == 0 {
 		return nil, fmt.Errorf("BlueBubbles message %s has no chats", bbMessage.GUID)
 	}
@@ -2532,6 +2545,14 @@ func (bb *blueBubbles) convertBBMessageToiMessage(bbMessage Message) (*imessage.
 	if len(bbMessage.Attachments) > 0 {
 		message.Attachments = make([]*imessage.Attachment, len(bbMessage.Attachments))
 		for i, bbAttachment := range bbMessage.Attachments {
+			if !downloadAttachments {
+				message.Attachments[i] = &imessage.Attachment{
+					GUID:     bbAttachment.GUID,
+					FileName: bbAttachment.TransferName,
+					MimeType: bbAttachment.MimeType,
+				}
+				continue
+			}
 			downloaded, err := bb.downloadAttachment(bbAttachment.GUID)
 			if err != nil {
 				bb.log.Err(err).Str("attachmentGUID", bbAttachment.GUID).Msg("Failed to download attachment")

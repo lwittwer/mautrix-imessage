@@ -1111,3 +1111,38 @@ func TestSendTimeoutUsesSendClientAndPreservesUncertainty(t *testing.T) {
 		t.Fatalf("timeout error leaked password: %s", err.Error())
 	}
 }
+
+func TestUpdatedMessageStatusDoesNotDownloadAttachments(t *testing.T) {
+	var attachmentRequests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/attachment/") {
+			attachmentRequests.Add(1)
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+	deliveredWithAttachment := json.RawMessage(`{
+		"guid": "msg-att-delivered",
+		"isFromMe": true,
+		"dateCreated": 1700000000000,
+		"dateDelivered": 1700000005000,
+		"chats": [{"guid": "iMessage;-;+15551234567"}],
+		"attachments": [{"guid": "att-1", "transferName": "pic.jpg", "mimeType": "image/jpeg"}]
+	}`)
+	if err := bb.handleMessageUpdated(deliveredWithAttachment); err != nil {
+		t.Fatalf("handleMessageUpdated failed: %v", err)
+	}
+	if attachmentRequests.Load() != 0 {
+		t.Fatalf("expected 0 attachment downloads for delivery status update, got %d", attachmentRequests.Load())
+	}
+	select {
+	case st := <-bb.MessageStatusChan():
+		if st.GUID != "msg-att-delivered" || st.Status != "delivered" {
+			t.Fatalf("unexpected delivery status: %+v", st)
+		}
+	default:
+		t.Fatal("expected delivered status event on MessageStatusChan")
+	}
+}
