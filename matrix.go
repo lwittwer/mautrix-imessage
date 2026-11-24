@@ -200,7 +200,7 @@ func (mx *WebsocketCommandHandler) handleWSCreateGroup(cmd appservice.WebsocketC
 	}
 	guids := make([]string, len(req.Users))
 	for i, identifier := range req.Users {
-		if strings.HasPrefix(identifier, "iMessage;-;") || strings.HasPrefix(identifier, "SMS;-;") {
+		if imessage.IsResolvedChatGUID(identifier) {
 			guids[i] = identifier
 		} else {
 			guids[i], err = mx.bridge.IM.ResolveIdentifier(identifier)
@@ -295,10 +295,23 @@ func (mx *WebsocketCommandHandler) StartChat(req StartDMRequest) (*StartDMRespon
 			return nil, fmt.Errorf("failed to resolve identifier: %w", err)
 		}
 	}
-	if parsed := imessage.ParseIdentifier(resp.GUID); parsed.Service == "SMS" && !isNumber(parsed.LocalID) {
+	parsed := imessage.ParseIdentifier(resp.GUID)
+	if (parsed.Service == "SMS" || parsed.Service == "RCS") && !isNumber(parsed.LocalID) {
 		mx.trackResolveIdentifier(!req.ActuallyStart, req.Identifier, "fail")
-		return nil, fmt.Errorf("can't start SMS with non-numeric identifier")
-	} else if portal := mx.bridge.GetPortalByGUID(resp.GUID); len(portal.MXID) > 0 || !req.ActuallyStart {
+		return nil, fmt.Errorf("can't start %s with non-numeric identifier", parsed.Service)
+	}
+	// On macOS Sequoia+, an existing DM portal may be keyed under "any;-;<localID>"
+	// even when handle resolution reports iMessage/SMS/RCS. Reuse it if present.
+	if !parsed.IsGroup && parsed.Service != "any" && parsed.LocalID != "" {
+		if existing := mx.bridge.GetPortalByGUIDIfExists(resp.GUID); existing == nil || len(existing.MXID) == 0 {
+			anyGUID := imessage.Identifier{Service: "any", LocalID: parsed.LocalID}.String()
+			if anyPortal := mx.bridge.GetPortalByGUIDIfExists(anyGUID); anyPortal != nil && len(anyPortal.MXID) > 0 {
+				resp.GUID = anyGUID
+				parsed = anyPortal.Identifier
+			}
+		}
+	}
+	if portal := mx.bridge.GetPortalByGUID(resp.GUID); len(portal.MXID) > 0 || !req.ActuallyStart {
 		status := "success"
 		if parsed.Service == "SMS" {
 			status = "sms"

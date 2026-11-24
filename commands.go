@@ -20,8 +20,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"go.mau.fi/mautrix-imessage/imessage"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridge/commands"
 )
 
@@ -43,8 +45,13 @@ func (br *IMBridge) RegisterCommands() {
 		commands.CommandLogoutMatrix,
 		commands.CommandDiscardMegolmSession,
 		commands.CommandSetPowerLevel,
+		cmdHealth,
 		cmdPM,
 		cmdCreateGroup,
+		cmdGroupRename,
+		cmdGroupAdd,
+		cmdGroupRemove,
+		cmdGroupLeave,
 		cmdSync,
 		cmdSearchContacts,
 		cmdRefreshContacts,
@@ -237,7 +244,7 @@ func fnCreateGroup(ce *WrappedCommandEvent) {
 
 	guids := make([]string, len(addresses))
 	for i, identifier := range addresses {
-		if strings.HasPrefix(identifier, "iMessage;-;") || strings.HasPrefix(identifier, "SMS;-;") {
+		if imessage.IsResolvedChatGUID(identifier) {
 			guids[i] = identifier
 		} else {
 			resolved, err := ce.Bridge.IM.ResolveIdentifier(identifier)
@@ -335,4 +342,316 @@ func fnSync(ce *WrappedCommandEvent) {
 		}
 		ce.Reply("%s Attempted sync for %d portal rooms.", contactStatus, attempted)
 	}()
+}
+
+var cmdHealth = &commands.FullHandler{
+	Func:    wrapCommand(fnHealth),
+	Name:    "health",
+	Aliases: []string{"status"},
+	Help: commands.HelpMeta{
+		Section:     HelpSectionManagingPortals,
+		Description: "Shows connector health, server version, Private API/helper status, websocket state, and last-event age.",
+	},
+	RequiresPortal: false,
+	RequiresLogin:  false,
+}
+
+func formatDurationShort(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d < time.Second {
+		return "<1s"
+	}
+	d = d.Round(time.Second)
+	days := d / (24 * time.Hour)
+	d %= 24 * time.Hour
+	hours := d / time.Hour
+	d %= time.Hour
+	mins := d / time.Minute
+	secs := (d % time.Minute) / time.Second
+
+	var parts []string
+	if days > 0 {
+		parts = append(parts, fmt.Sprintf("%dd", days))
+	}
+	if hours > 0 {
+		parts = append(parts, fmt.Sprintf("%dh", hours))
+	}
+	if mins > 0 {
+		parts = append(parts, fmt.Sprintf("%dm", mins))
+	}
+	if secs > 0 || len(parts) == 0 {
+		parts = append(parts, fmt.Sprintf("%ds", secs))
+	}
+	return strings.Join(parts, "")
+}
+
+func formatHealthReport(platform string, h *imessage.ConnectorHealth, now time.Time) string {
+	overall := "Healthy"
+	if !h.WSConnected {
+		overall = "Disconnected"
+	} else if h.ServerInfoErr != "" {
+		overall = "Degraded (server info unreachable)"
+	} else if h.PrivateAPI && h.HelperConnected != nil && !*h.HelperConnected {
+		overall = "Degraded (Private API helper disconnected from Messages.app)"
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "**Bridge Health (%s):** %s\n", platform, overall)
+
+	if h.ServerVersion != "" || h.OSVersion != "" {
+		serverStr := h.ServerVersion
+		if serverStr == "" {
+			serverStr = "unknown"
+		}
+		if h.OSVersion != "" {
+			fmt.Fprintf(&b, "- **Server:** %s (macOS %s)\n", serverStr, h.OSVersion)
+		} else {
+			fmt.Fprintf(&b, "- **Server:** %s\n", serverStr)
+		}
+	}
+	if h.ProxyService != "" {
+		fmt.Fprintf(&b, "- **Proxy:** %s\n", h.ProxyService)
+	}
+
+	privateStr := "disabled"
+	if h.PrivateAPI {
+		privateStr = "enabled"
+	}
+	helperStr := "not reported"
+	if h.HelperConnected != nil {
+		if *h.HelperConnected {
+			helperStr = "connected"
+		} else {
+			helperStr = "DISCONNECTED"
+		}
+	}
+	fmt.Fprintf(&b, "- **Private API:** %s (helper: %s)\n", privateStr, helperStr)
+
+	if h.WSConnected {
+		uptime := ""
+		if !h.ConnectedSince.IsZero() {
+			uptime = fmt.Sprintf(" (up %s)", formatDurationShort(now.Sub(h.ConnectedSince)))
+		}
+		fmt.Fprintf(&b, "- **WebSocket:** connected%s, reconnects: %d\n", uptime, h.ReconnectCount)
+	} else {
+		downtime := ""
+		if !h.DisconnectedSince.IsZero() {
+			downtime = fmt.Sprintf(" (down %s)", formatDurationShort(now.Sub(h.DisconnectedSince)))
+		}
+		fmt.Fprintf(&b, "- **WebSocket:** disconnected%s, reconnects: %d\n", downtime, h.ReconnectCount)
+	}
+	if h.LastDisconnectErr != "" {
+		fmt.Fprintf(&b, "- **Last disconnect error:** `%s`\n", h.LastDisconnectErr)
+	}
+
+	if h.LastEventAt.IsZero() {
+		fmt.Fprintf(&b, "- **Last event:** none yet\n")
+	} else {
+		fmt.Fprintf(&b, "- **Last event:** %s ago\n", formatDurationShort(now.Sub(h.LastEventAt)))
+	}
+
+	if !h.LastCatchUpAt.IsZero() {
+		catchUpLine := fmt.Sprintf("%s ago (%d chats, %d messages)", formatDurationShort(now.Sub(h.LastCatchUpAt)), h.LastCatchUpChats, h.LastCatchUpMsgs)
+		if h.LastCatchUpErr != "" {
+			catchUpLine += fmt.Sprintf(" — error: `%s`", h.LastCatchUpErr)
+		}
+		fmt.Fprintf(&b, "- **Last catch-up sync:** %s\n", catchUpLine)
+	}
+
+	if h.ServerInfoErr != "" {
+		fmt.Fprintf(&b, "- **Server info error:** `%s`\n", h.ServerInfoErr)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func fnHealth(ce *WrappedCommandEvent) {
+	ce.Bridge.ZLog.Trace().Str("cmd", ce.Command).Msg("fnHealth")
+
+	healthAPI, ok := ce.Bridge.IM.(imessage.HealthAPI)
+	if !ok {
+		ce.Reply("Health reporting is not supported by connector `%s`.", ce.Bridge.Config.IMessage.Platform)
+		return
+	}
+	health := healthAPI.GetHealth()
+	if health == nil {
+		ce.Reply("Connector `%s` did not return health status.", ce.Bridge.Config.IMessage.Platform)
+		return
+	}
+	ce.Reply("%s", formatHealthReport(ce.Bridge.Config.IMessage.Platform, health, time.Now()))
+}
+
+func requirePortalGroupAdmin(ce *WrappedCommandEvent) (imessage.GroupAdminAPI, bool) {
+	if ce.Portal == nil || ce.Portal.IsPrivateChat() {
+		ce.Reply("This command must be run inside a bridged group chat room.")
+		return nil, false
+	}
+	groupAdmin, ok := ce.Bridge.IM.(imessage.GroupAdminAPI)
+	if !ok || !ce.Bridge.IM.Capabilities().GroupAdmin {
+		ce.Reply("Group management is not supported (requires BlueBubbles Private API).")
+		return nil, false
+	}
+	if ce.Portal.effectiveService() == "SMS" {
+		ce.Reply("SMS/MMS group chats cannot be modified.")
+		return nil, false
+	}
+	return groupAdmin, true
+}
+
+func resolveParticipantLocalID(ce *WrappedCommandEvent, raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", errors.New("empty participant identifier")
+	}
+	if imessage.IsResolvedChatGUID(trimmed) {
+		return imessage.ParseIdentifier(trimmed).LocalID, nil
+	}
+	if resolved, err := ce.Bridge.IM.ResolveIdentifier(trimmed); err == nil {
+		if localID := imessage.ParseIdentifier(resolved).LocalID; localID != "" {
+			return localID, nil
+		}
+	}
+	if !strings.Contains(trimmed, "@") {
+		var digits strings.Builder
+		for _, r := range trimmed {
+			if r >= '0' && r <= '9' {
+				digits.WriteRune(r)
+			}
+		}
+		if digits.Len() > 0 {
+			return "+" + digits.String(), nil
+		}
+	}
+	return trimmed, nil
+}
+
+var cmdGroupRename = &commands.FullHandler{
+	Func: wrapCommand(fnGroupRename),
+	Name: "group-rename",
+	Help: commands.HelpMeta{
+		Section:     HelpSectionManagingPortals,
+		Description: "Renames the current iMessage group chat (requires Private API).",
+		Args:        "<_new name_>",
+	},
+	RequiresPortal: true,
+	RequiresLogin:  false,
+}
+
+func fnGroupRename(ce *WrappedCommandEvent) {
+	groupAdmin, ok := requirePortalGroupAdmin(ce)
+	if !ok {
+		return
+	}
+	newName := strings.TrimSpace(ce.RawArgs)
+	if newName == "" {
+		ce.Reply("**Usage:** `group-rename <new name>`")
+		return
+	}
+	if err := groupAdmin.SetGroupName(ce.Portal.GUID, newName); err != nil {
+		ce.Reply("Failed to rename group: %s", err)
+		return
+	}
+	ce.Portal.UpdateName(newName, ce.Portal.MainIntent())
+	ce.Portal.Update(nil)
+	ce.Reply("Renamed group to **%s**.", newName)
+}
+
+var cmdGroupAdd = &commands.FullHandler{
+	Func: wrapCommand(fnGroupAdd),
+	Name: "group-add",
+	Help: commands.HelpMeta{
+		Section:     HelpSectionManagingPortals,
+		Description: "Adds a participant (phone number or Apple ID email) to the current iMessage group chat.",
+		Args:        "<_phone or email_>",
+	},
+	RequiresPortal: true,
+	RequiresLogin:  false,
+}
+
+func fnGroupAdd(ce *WrappedCommandEvent) {
+	groupAdmin, ok := requirePortalGroupAdmin(ce)
+	if !ok {
+		return
+	}
+	if len(ce.Args) == 0 {
+		ce.Reply("**Usage:** `group-add <phone number or Apple ID email>`")
+		return
+	}
+	localID, err := resolveParticipantLocalID(ce, ce.RawArgs)
+	if err != nil {
+		ce.Reply("Invalid participant: %s", err)
+		return
+	}
+	if err := groupAdmin.AddGroupParticipant(ce.Portal.GUID, localID); err != nil {
+		ce.Reply("Failed to add `%s` to group: %s", localID, err)
+		return
+	}
+	puppet := ce.Bridge.GetPuppetByLocalID(localID)
+	puppet.Sync()
+	if err := puppet.Intent.EnsureJoined(ce.Portal.MXID); err != nil {
+		ce.Bridge.ZLog.Warn().Err(err).Str("puppet", puppet.MXID.String()).Msg("Failed to join added participant puppet")
+	}
+	ce.Reply("Added `%s` to the group.", localID)
+}
+
+var cmdGroupRemove = &commands.FullHandler{
+	Func: wrapCommand(fnGroupRemove),
+	Name: "group-remove",
+	Help: commands.HelpMeta{
+		Section:     HelpSectionManagingPortals,
+		Description: "Removes a participant (phone number or Apple ID email) from the current iMessage group chat.",
+		Args:        "<_phone or email_>",
+	},
+	RequiresPortal: true,
+	RequiresLogin:  false,
+}
+
+func fnGroupRemove(ce *WrappedCommandEvent) {
+	groupAdmin, ok := requirePortalGroupAdmin(ce)
+	if !ok {
+		return
+	}
+	if len(ce.Args) == 0 {
+		ce.Reply("**Usage:** `group-remove <phone number or Apple ID email>`")
+		return
+	}
+	localID, err := resolveParticipantLocalID(ce, ce.RawArgs)
+	if err != nil {
+		ce.Reply("Invalid participant: %s", err)
+		return
+	}
+	if err := groupAdmin.RemoveGroupParticipant(ce.Portal.GUID, localID); err != nil {
+		ce.Reply("Failed to remove `%s` from group: %s", localID, err)
+		return
+	}
+	puppet := ce.Bridge.GetPuppetByLocalID(localID)
+	_, _ = ce.Portal.MainIntent().KickUser(ce.Portal.MXID, &mautrix.ReqKickUser{
+		UserID: puppet.MXID,
+		Reason: "Removed from iMessage group",
+	})
+	ce.Reply("Removed `%s` from the group.", localID)
+}
+
+var cmdGroupLeave = &commands.FullHandler{
+	Func: wrapCommand(fnGroupLeave),
+	Name: "group-leave",
+	Help: commands.HelpMeta{
+		Section:     HelpSectionManagingPortals,
+		Description: "Leaves the current iMessage group chat.",
+	},
+	RequiresPortal: true,
+	RequiresLogin:  false,
+}
+
+func fnGroupLeave(ce *WrappedCommandEvent) {
+	groupAdmin, ok := requirePortalGroupAdmin(ce)
+	if !ok {
+		return
+	}
+	if err := groupAdmin.LeaveGroup(ce.Portal.GUID); err != nil {
+		ce.Reply("Failed to leave group: %s", err)
+		return
+	}
+	ce.Reply("Left the iMessage group.")
 }

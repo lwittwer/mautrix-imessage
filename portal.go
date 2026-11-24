@@ -256,16 +256,53 @@ type Portal struct {
 
 	userIsTyping bool
 	typingLock   sync.Mutex
+
+	lastSeenService string
+	serviceLock     sync.RWMutex
 }
 
 var (
 	_ bridge.Portal                    = (*Portal)(nil)
 	_ bridge.ReadReceiptHandlingPortal = (*Portal)(nil)
 	_ bridge.TypingPortal              = (*Portal)(nil)
-	//	_ bridge.MembershipHandlingPortal = (*Portal)(nil)
-	//	_ bridge.MetaHandlingPortal = (*Portal)(nil)
+	_ bridge.MembershipHandlingPortal  = (*Portal)(nil)
+	_ bridge.MetaHandlingPortal        = (*Portal)(nil)
 	//	_ bridge.DisappearingPortal = (*Portal)(nil)
 )
+
+func (portal *Portal) effectiveService() string {
+	if portal.Identifier.Service != "" && portal.Identifier.Service != "any" {
+		return portal.Identifier.Service
+	}
+	portal.serviceLock.RLock()
+	svc := portal.lastSeenService
+	portal.serviceLock.RUnlock()
+	if svc != "" && svc != "any" {
+		return svc
+	}
+	if portal.LastSeenHandle != "" {
+		if parsed := imessage.ParseIdentifier(portal.LastSeenHandle); parsed.Service != "" && parsed.Service != "any" {
+			return parsed.Service
+		}
+	}
+	return "iMessage"
+}
+
+func (portal *Portal) noteMessageService(service string) {
+	if portal.Identifier.Service != "any" || service == "" || service == "any" {
+		return
+	}
+	portal.serviceLock.Lock()
+	changed := portal.lastSeenService != service
+	if changed {
+		portal.lastSeenService = service
+	}
+	portal.serviceLock.Unlock()
+	if changed && len(portal.MXID) > 0 {
+		portal.log.Debugfln("Updated effective service for %s to %s", portal.GUID, service)
+		portal.UpdateBridgeInfo()
+	}
+}
 
 func (portal *Portal) IsEncrypted() bool {
 	return portal.Encrypted
@@ -530,6 +567,9 @@ func (portal *Portal) handleMessageLoop() {
 			case event.EventReaction:
 				thing = "Matrix reaction"
 				portal.HandleMatrixReaction(evt)
+			case event.StateRoomName, event.StateRoomAvatar:
+				thing = "Matrix room metadata"
+				portal.handleMatrixMetaEvent(evt)
 			default:
 				thing = "unsupported Matrix event"
 				portal.log.Warnln("Unsupported event type %+v in portal message channel", evt.Type)
@@ -605,21 +645,40 @@ func (portal *Portal) HandleiMessageSendMessageStatus(msgStatus *imessage.SendMe
 	}
 }
 
+func (portal *Portal) canManageGroup() bool {
+	return !portal.IsPrivateChat() &&
+		portal.bridge != nil &&
+		portal.bridge.IM != nil &&
+		portal.bridge.IM.Capabilities().GroupAdmin &&
+		portal.effectiveService() != "SMS"
+}
+
 func (portal *Portal) GetBasePowerLevels() *event.PowerLevelsEventContent {
 	anyone := 0
+	moderator := 50
 	nope := 99
+	inviteLevel := nope
+	kickLevel := nope
+	users := map[id.UserID]int{
+		portal.MainIntent().UserID: 100,
+		portal.bridge.Bot.UserID:   100,
+	}
+	if portal.canManageGroup() {
+		inviteLevel = moderator
+		kickLevel = moderator
+		if portal.bridge.user != nil && portal.bridge.user.MXID != "" {
+			users[portal.bridge.user.MXID] = moderator
+		}
+	}
 	return &event.PowerLevelsEventContent{
 		UsersDefault:    anyone,
 		EventsDefault:   anyone,
 		RedactPtr:       &anyone,
 		StateDefaultPtr: &nope,
 		BanPtr:          &nope,
-		InvitePtr:       &nope,
-		KickPtr:         &nope,
-		Users: map[id.UserID]int{
-			portal.MainIntent().UserID: 100,
-			portal.bridge.Bot.UserID:   100,
-		},
+		InvitePtr:       &inviteLevel,
+		KickPtr:         &kickLevel,
+		Users:           users,
 		Events: map[string]int{
 			event.StateRoomName.Type:   anyone,
 			event.StateRoomAvatar.Type: anyone,
@@ -629,7 +688,24 @@ func (portal *Portal) GetBasePowerLevels() *event.PowerLevelsEventContent {
 }
 
 func (portal *Portal) updatePowerLevels(pl *event.PowerLevelsEventContent) bool {
-	return pl.EnsureUserLevel(portal.bridge.Bot.UserID, 100)
+	changed := pl.EnsureUserLevel(portal.bridge.Bot.UserID, 100)
+	if portal.canManageGroup() && portal.bridge.user != nil && portal.bridge.user.MXID != "" {
+		moderator := 50
+		if pl.Invite() > moderator {
+			pl.InvitePtr = &moderator
+			changed = true
+		}
+		if pl.Kick() > moderator {
+			pl.KickPtr = &moderator
+			changed = true
+		}
+		if pl.GetUserLevel(portal.bridge.user.MXID) < moderator {
+			if pl.EnsureUserLevel(portal.bridge.user.MXID, moderator) {
+				changed = true
+			}
+		}
+	}
+	return changed
 }
 
 func (portal *Portal) getBridgeInfoStateKey() string {
@@ -642,6 +718,7 @@ func (portal *Portal) getBridgeInfoStateKey() string {
 }
 
 func (portal *Portal) getBridgeInfo() (string, CustomBridgeInfoContent) {
+	effectiveSvc := portal.effectiveService()
 	bridgeInfo := CustomBridgeInfoContent{
 		BridgeEventContent: event.BridgeEventContent{
 			BridgeBot: portal.bridge.Bot.UserID,
@@ -663,13 +740,13 @@ func (portal *Portal) getBridgeInfo() (string, CustomBridgeInfoContent) {
 			GUID:     portal.GUID,
 			ThreadID: portal.ThreadID,
 			IsGroup:  portal.Identifier.IsGroup,
-			Service:  portal.Identifier.Service,
+			Service:  effectiveSvc,
 
 			SendStatusStart: portal.bridge.SendStatusStartTS,
 			TimeoutSeconds:  portal.bridge.Config.Bridge.MaxHandleSeconds,
 		},
 	}
-	if portal.Identifier.Service == "SMS" {
+	if effectiveSvc == "SMS" {
 		if portal.bridge.Config.IMessage.Platform == "android" {
 			bridgeInfo.Protocol.ID = "android-sms"
 			bridgeInfo.Protocol.DisplayName = "Android SMS"
@@ -679,6 +756,9 @@ func (portal *Portal) getBridgeInfo() (string, CustomBridgeInfoContent) {
 			bridgeInfo.Protocol.ID = "imessage-sms"
 			bridgeInfo.Protocol.DisplayName = "iMessage (SMS)"
 		}
+	} else if effectiveSvc == "RCS" {
+		bridgeInfo.Protocol.ID = "imessage-sms"
+		bridgeInfo.Protocol.DisplayName = "iMessage (RCS)"
 	} else if portal.bridge.Config.IMessage.Platform == "ios" {
 		bridgeInfo.Protocol.ID = "imessage-ios"
 	} else if portal.bridge.Config.IMessage.Platform == "mac-nosip" {
@@ -1101,7 +1181,7 @@ func (portal *Portal) sendSuccessCheckpoint(eventID id.EventID, service, handle 
 	}
 	go func() {
 		portal.bridge.SendRawMessageCheckpoint(&checkpoint)
-		if (portal.Identifier.IsGroup || portal.Identifier.Service == "SMS") && portal.bridge.IM.Capabilities().DeliveredStatus {
+		if (portal.Identifier.IsGroup || portal.effectiveService() == "SMS") && portal.bridge.IM.Capabilities().DeliveredStatus {
 			portal.bridge.SendRawMessageCheckpoint(&status.MessageCheckpoint{
 				EventID:    eventID,
 				RoomID:     portal.MXID,
@@ -1131,8 +1211,9 @@ func (portal *Portal) sendSuccessMessageStatus(eventID id.EventID, service, hand
 		Status: event.MessageStatusSuccess,
 	}
 
-	if !portal.Identifier.IsGroup && portal.Identifier.Service == "iMessage" && portal.bridge.IM.Capabilities().DeliveredStatus {
-		// This is an iMessage DM, then we want to include the list of users
+	effectiveSvc := portal.effectiveService()
+	if !portal.Identifier.IsGroup && (effectiveSvc == "iMessage" || effectiveSvc == "RCS") && portal.bridge.IM.Capabilities().DeliveredStatus {
+		// This is an iMessage or RCS DM, so include the list of users
 		// that the message has been delivered to.
 		mainContent.DeliveredToUsers = &deliveredTo
 	}
@@ -1381,7 +1462,7 @@ func (portal *Portal) handleMatrixMedia(msg *event.MessageEventContent, evt *eve
 	}
 
 	mediaViewerMinSize := portal.bridge.Config.Bridge.MediaViewer.IMMinSize
-	if portal.Identifier.Service == "SMS" {
+	if portal.effectiveService() == "SMS" {
 		mediaViewerMinSize = portal.bridge.Config.Bridge.MediaViewer.SMSMinSize
 	}
 	if len(portal.bridge.Config.Bridge.MediaViewer.URL) > 0 && mediaViewerMinSize > 0 && msg.Info != nil && msg.Info.Size >= mediaViewerMinSize {
@@ -1441,12 +1522,13 @@ func (portal *Portal) handleMatrixMediaDirect(url id.ContentURI, file *event.Enc
 		portal.log.Errorfln("failed to prepare to send file: %v", err)
 		return
 	}
+	defer portal.bridge.IM.SendFileCleanup(dir)
 	mimeType := mimetype.Detect(data).String()
 	isVoiceMemo := false
 	_, isMSC3245Voice := evt.Content.Raw["org.matrix.msc3245.voice"]
 
-	// Only convert when sending to iMessage. SMS users probably don't want CAF.
-	if portal.Identifier.Service == "iMessage" && isMSC3245Voice && strings.HasPrefix(mimeType, "audio/") {
+	// Only convert when sending to iMessage. SMS/RCS users probably don't want CAF.
+	if portal.effectiveService() == "iMessage" && isMSC3245Voice && strings.HasPrefix(mimeType, "audio/") {
 		filePath, err = ffmpeg.ConvertPath(context.TODO(), filePath, ".caf", []string{}, []string{"-c:a", "libopus"}, false)
 		mimeType = "audio/x-caf"
 		isVoiceMemo = true
@@ -1459,7 +1541,6 @@ func (portal *Portal) handleMatrixMediaDirect(url id.ContentURI, file *event.Enc
 	}
 
 	resp, err = portal.bridge.IM.SendFile(portal.getTargetGUID("media message", evt.ID, ""), caption, filename, filePath, messageReplyID, messageReplyPart, mimeType, isVoiceMemo, metadata)
-	portal.bridge.IM.SendFileCleanup(dir)
 	return
 }
 
@@ -1513,7 +1594,7 @@ func (portal *Portal) HandleMatrixReadReceipt(user bridge.User, eventID id.Event
 const typingNotificationsTemporarilyDisabled = false
 
 func (portal *Portal) HandleMatrixTyping(userIDs []id.UserID) {
-	if portal.Identifier.Service == "SMS" {
+	if portal.effectiveService() == "SMS" {
 		return
 	} else if typingNotificationsTemporarilyDisabled {
 		portal.log.Debugfln("Dropping typing notification %v", userIDs)
@@ -1709,6 +1790,13 @@ func (portal *Portal) HandleMatrixRedaction(evt *event.Event) {
 }
 
 func (portal *Portal) UpdateAvatar(attachment *imessage.Attachment, intent *appservice.IntentAPI) *id.EventID {
+	if attachment.IsTemp && attachment.PathOnDisk != "" {
+		defer func() {
+			if err := attachment.Delete(); err != nil {
+				portal.log.Warnfln("Failed to delete temp avatar attachment: %v", err)
+			}
+		}()
+	}
 	data, err := attachment.Read()
 	if err != nil {
 		portal.log.Errorfln("Failed to read avatar attachment: %v", err)
@@ -1838,28 +1926,48 @@ func (portal *Portal) handleIMMemberChange(msg *imessage.Message, dbMessage *dat
 }
 
 func (portal *Portal) convertIMAttachment(msg *imessage.Message, attach *imessage.Attachment, intent *appservice.IntentAPI) (*event.MessageEventContent, map[string]interface{}, error) {
-	data, err := attach.Read()
-	if err != nil {
-		portal.log.Errorfln("Failed to read attachment in %s: %v", msg.GUID, err)
-		return nil, nil, fmt.Errorf("failed to read attachment: %w", err)
-	}
-	if portal.bridge.Config.IMessage.DeleteMediaAfterUpload {
+	if portal.bridge.Config.IMessage.DeleteMediaAfterUpload || attach.IsTemp {
 		defer func() {
-			err = attach.Delete()
+			if attach.PathOnDisk == "" {
+				return
+			}
+			err := attach.Delete()
 			if err != nil {
 				portal.log.Warnfln("Failed to delete attachment in %s: %v", msg.GUID, err)
 			}
 		}()
 	}
+	data, err := attach.Read()
+	if err != nil {
+		portal.log.Errorfln("Failed to read attachment in %s: %v", msg.GUID, err)
+		return nil, nil, fmt.Errorf("failed to read attachment: %w", err)
+	}
 
 	mimeType := attach.GetMimeType()
 	fileName := attach.GetFileName()
 	extraContent := map[string]interface{}{}
+	var audioDuration int
 
 	if msg.IsAudioMessage {
-		ogg, err := ffmpeg.ConvertBytes(context.TODO(), data, ".ogg", []string{}, []string{"-c:a", "libopus"}, "audio/x-caf")
+		inputMime := mimeType
+		if inputMime == "" || inputMime == "application/octet-stream" {
+			inputMime = "audio/x-caf"
+		}
+		ogg, err := ffmpeg.ConvertBytes(context.TODO(), data, ".ogg", []string{}, []string{"-c:a", "libopus"}, inputMime)
 		if err == nil {
-			extraContent["org.matrix.msc1767.audio"] = map[string]interface{}{}
+			audioMeta := map[string]interface{}{}
+			if durationMs, waveform, metaErr := extractVoiceMetadata(context.TODO(), ogg); metaErr == nil {
+				if durationMs > 0 {
+					audioMeta["duration"] = durationMs
+					audioDuration = durationMs
+				}
+				if len(waveform) > 0 {
+					audioMeta["waveform"] = waveform
+				}
+			} else {
+				portal.log.Warnfln("Failed to extract voice metadata for %s: %v", msg.GUID, metaErr)
+			}
+			extraContent["org.matrix.msc1767.audio"] = audioMeta
 			extraContent["org.matrix.msc3245.voice"] = map[string]interface{}{}
 			mimeType = "audio/ogg"
 			fileName = "Voice Message.ogg"
@@ -1937,6 +2045,7 @@ func (portal *Portal) convertIMAttachment(msg *imessage.Message, attach *imessag
 	content.Info = &event.FileInfo{
 		MimeType: mimeType,
 		Size:     len(data),
+		Duration: audioDuration,
 	}
 	switch strings.Split(mimeType, "/")[0] {
 	case "image":
@@ -2227,6 +2336,8 @@ func (portal *Portal) HandleiMessage(msg *imessage.Message) id.EventID {
 
 	// Look up the message in the database
 	dbMessage = portal.bridge.DB.Message.GetLastByGUID(portal.GUID, msg.GUID)
+
+	portal.noteMessageService(msg.Service)
 
 	if portal.IsPrivateChat() && msg.ChatGUID != portal.LastSeenHandle {
 		portal.log.Debugfln("Updating last seen handle from %s to %s", portal.LastSeenHandle, msg.ChatGUID)
@@ -2539,4 +2650,165 @@ func (portal *Portal) Cleanup(puppetsOnly bool) {
 	if err != nil {
 		portal.log.Errorln("Error leaving with main intent while cleaning up portal:", err)
 	}
+}
+
+func (portal *Portal) sendGroupAdminNotice(msg string) {
+	if len(portal.MXID) == 0 {
+		return
+	}
+	_, err := portal.sendMessage(portal.MainIntent(), event.EventMessage, &event.MessageEventContent{
+		MsgType: event.MsgNotice,
+		Body:    msg,
+	}, map[string]interface{}{}, 0)
+	if err != nil {
+		portal.log.Warnfln("Failed to send group admin notice: %v", err)
+	}
+}
+
+func (portal *Portal) HandleMatrixMeta(sender bridge.User, evt *event.Event) {
+	if portal.IsPrivateChat() || sender.GetMXID() != portal.bridge.user.MXID {
+		return
+	}
+	if evt.Type != event.StateRoomName && evt.Type != event.StateRoomAvatar {
+		return
+	}
+	if !portal.canManageGroup() {
+		return
+	}
+	portal.MatrixMessages <- evt
+}
+
+func (portal *Portal) handleMatrixMetaEvent(evt *event.Event) {
+	groupAdmin, ok := portal.bridge.IM.(imessage.GroupAdminAPI)
+	if !ok || !portal.canManageGroup() {
+		return
+	}
+	if evt.Content.Parsed == nil {
+		_ = evt.Content.ParseRaw(evt.Type)
+	}
+
+	switch evt.Type {
+	case event.StateRoomName:
+		content, ok := evt.Content.Parsed.(*event.RoomNameEventContent)
+		if !ok {
+			return
+		}
+		if content.Name == portal.Name {
+			return
+		}
+		if err := groupAdmin.SetGroupName(portal.GUID, content.Name); err != nil {
+			portal.log.Warnfln("Failed to rename iMessage group %s to %q: %v", portal.GUID, content.Name, err)
+			portal.sendGroupAdminNotice(fmt.Sprintf("Failed to rename iMessage group: %v", err))
+			if portal.Name != "" {
+				_, _ = portal.MainIntent().SetRoomName(portal.MXID, portal.Name)
+			}
+			return
+		}
+		portal.Name = content.Name
+		portal.Update(nil)
+		portal.UpdateBridgeInfo()
+
+	case event.StateRoomAvatar:
+		content, ok := evt.Content.Parsed.(*event.RoomAvatarEventContent)
+		if !ok {
+			return
+		}
+		if content.URL == portal.AvatarURL {
+			return
+		}
+		if content.URL.IsEmpty() {
+			if err := groupAdmin.RemoveGroupAvatar(portal.GUID); err != nil {
+				portal.log.Warnfln("Failed to remove iMessage group avatar for %s: %v", portal.GUID, err)
+				portal.sendGroupAdminNotice(fmt.Sprintf("Failed to remove iMessage group avatar: %v", err))
+				return
+			}
+			portal.AvatarURL = id.ContentURI{}
+			portal.AvatarHash = nil
+			portal.Update(nil)
+			portal.UpdateBridgeInfo()
+			return
+		}
+		data, err := portal.MainIntent().DownloadBytes(content.URL)
+		if err != nil {
+			portal.log.Warnfln("Failed to download room avatar %s: %v", content.URL, err)
+			portal.sendGroupAdminNotice(fmt.Sprintf("Failed to download room avatar: %v", err))
+			return
+		}
+		hash := sha256.Sum256(data)
+		if portal.AvatarHash != nil && *portal.AvatarHash == hash {
+			portal.AvatarURL = content.URL
+			portal.Update(nil)
+			return
+		}
+		ext := mimetype.Detect(data).Extension()
+		if ext == "" {
+			ext = ".jpg"
+		}
+		if err := groupAdmin.SetGroupAvatar(portal.GUID, "avatar"+ext, data); err != nil {
+			portal.log.Warnfln("Failed to set iMessage group avatar for %s: %v", portal.GUID, err)
+			portal.sendGroupAdminNotice(fmt.Sprintf("Failed to set iMessage group avatar: %v", err))
+			return
+		}
+		portal.AvatarURL = content.URL
+		portal.AvatarHash = &hash
+		portal.Update(nil)
+		portal.UpdateBridgeInfo()
+	}
+}
+
+func (portal *Portal) HandleMatrixInvite(sender bridge.User, ghost bridge.Ghost) {
+	if portal.IsPrivateChat() || sender.GetMXID() != portal.bridge.user.MXID {
+		return
+	}
+	groupAdmin, ok := portal.bridge.IM.(imessage.GroupAdminAPI)
+	if !ok || !portal.canManageGroup() {
+		return
+	}
+	puppet, ok := ghost.(*Puppet)
+	if !ok || puppet == nil {
+		return
+	}
+	if err := groupAdmin.AddGroupParticipant(portal.GUID, puppet.ID); err != nil {
+		portal.log.Warnfln("Failed to add %s to iMessage group %s: %v", puppet.ID, portal.GUID, err)
+		portal.sendGroupAdminNotice(fmt.Sprintf("Failed to add %s to iMessage group: %v", puppet.ID, err))
+		_, _ = portal.MainIntent().KickUser(portal.MXID, &mautrix.ReqKickUser{
+			UserID: puppet.MXID,
+			Reason: "Failed to add participant to iMessage group",
+		})
+		return
+	}
+	puppet.Sync()
+	if err := puppet.Intent.EnsureJoined(portal.MXID); err != nil {
+		portal.log.Warnfln("Failed to join newly added puppet %s to %s: %v", puppet.MXID, portal.MXID, err)
+	}
+}
+
+func (portal *Portal) HandleMatrixKick(sender bridge.User, ghost bridge.Ghost) {
+	if portal.IsPrivateChat() || sender.GetMXID() != portal.bridge.user.MXID {
+		return
+	}
+	groupAdmin, ok := portal.bridge.IM.(imessage.GroupAdminAPI)
+	if !ok || !portal.canManageGroup() {
+		return
+	}
+	puppet, ok := ghost.(*Puppet)
+	if !ok || puppet == nil {
+		return
+	}
+	if err := groupAdmin.RemoveGroupParticipant(portal.GUID, puppet.ID); err != nil {
+		portal.log.Warnfln("Failed to remove %s from iMessage group %s: %v", puppet.ID, portal.GUID, err)
+		portal.sendGroupAdminNotice(fmt.Sprintf("Failed to remove %s from iMessage group: %v", puppet.ID, err))
+		if joinErr := puppet.Intent.EnsureJoined(portal.MXID); joinErr != nil {
+			portal.log.Warnfln("Failed to re-join puppet %s after failed remove: %v", puppet.MXID, joinErr)
+		}
+	}
+}
+
+func (portal *Portal) HandleMatrixLeave(sender bridge.User) {
+	if portal.IsPrivateChat() || sender.GetMXID() != portal.bridge.user.MXID {
+		return
+	}
+	// Leaving a Matrix room is often used to dismiss a chat without permanently exiting
+	// an iMessage group. Use the explicit `group-leave` command to leave on iMessage.
+	portal.log.Debugfln("Ignoring Matrix leave by %s in group %s (use group-leave command to leave iMessage group)", sender.GetMXID(), portal.GUID)
 }

@@ -250,10 +250,10 @@ func applyMeta(portal *Portal, meta func(portal *Portal)) {
 }
 
 func (puppet *Puppet) updatePortalMeta(meta func(portal *Portal)) {
-	imID := imessage.Identifier{Service: "iMessage", LocalID: puppet.ID}.String()
-	applyMeta(puppet.bridge.GetPortalByGUID(imID), meta)
-	smsID := imessage.Identifier{Service: "SMS", LocalID: puppet.ID}.String()
-	applyMeta(puppet.bridge.GetPortalByGUID(smsID), meta)
+	for _, service := range []string{"iMessage", "SMS", "RCS", "any"} {
+		chatID := imessage.Identifier{Service: service, LocalID: puppet.ID}.String()
+		applyMeta(puppet.bridge.GetPortalByGUIDIfExists(chatID), meta)
+	}
 }
 
 func (puppet *Puppet) updatePortalAvatar() {

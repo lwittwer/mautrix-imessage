@@ -103,23 +103,29 @@ func (portal *Portal) forwardBackfill() {
 		backfillID = fmt.Sprintf("bridge-catchup-ts-%s::%d::%d", portal.Identifier.LocalID, startTime.UnixMilli(), time.Now().UnixMilli())
 		messages, err = portal.bridge.IM.GetMessagesSinceDate(portal.GUID, startTime, backfillID)
 	}
-	allSkipped := true
-	for index, msg := range messages {
-		if portal.bridge.DB.Message.GetByGUID(msg.ChatGUID, msg.GUID, 0) != nil {
-			portal.log.Debugfln("Skipping duplicate message %s at start of forward backfill batch", msg.GUID)
-			continue
-		}
-		allSkipped = false
-		messages = messages[index:]
-		break
-	}
 	if err != nil {
 		portal.log.Errorln("Failed to fetch messages for backfilling:", err)
 		go portal.bridge.IM.SendBackfillResult(portal.GUID, backfillID, false, nil)
-	} else if len(messages) == 0 || allSkipped {
+		return
+	}
+	filtered := make([]*imessage.Message, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Tapback != nil {
+			if portal.bridge.DB.Tapback.GetByTapbackGUID(portal.GUID, msg.GUID) != nil {
+				portal.log.Debugfln("Skipping duplicate tapback %s in forward backfill batch", msg.GUID)
+				continue
+			}
+		} else if portal.bridge.DB.Message.GetByGUID(msg.ChatGUID, msg.GUID, 0) != nil ||
+			portal.bridge.DB.Message.GetByGUID(portal.GUID, msg.GUID, 0) != nil {
+			portal.log.Debugfln("Skipping duplicate message %s in forward backfill batch", msg.GUID)
+			continue
+		}
+		filtered = append(filtered, msg)
+	}
+	if len(filtered) == 0 {
 		portal.log.Debugln("Nothing to backfill")
 	} else {
-		portal.sendBackfill(backfillID, messages, true, false, false)
+		portal.sendBackfill(backfillID, filtered, true, false, false)
 	}
 }
 
@@ -180,7 +186,7 @@ func (portal *Portal) convertBackfill(messages []*imessage.Message) ([]*event.Ev
 
 			events = append(events, evt)
 			metas = append(metas, messageWithIndex{msg, intent, nil, index})
-			metaIndexes[messageIndex{msg.GUID, index}] = len(metas)
+			metaIndexes[messageIndex{msg.GUID, index}] = len(metas) - 1
 		}
 		isRead = msg.IsRead || msg.IsFromMe || (unreadThreshold >= 0 && time.Since(msg.Time) > unreadThreshold)
 	}
@@ -229,7 +235,7 @@ func (portal *Portal) convertTapbacks(messages []*imessage.Message) ([]*event.Ev
 
 		events = append(events, evt)
 		metas = append(metas, messageWithIndex{msg, intent, dbMessage, 0})
-		metaIndexes[messageIndex{msg.GUID, 0}] = len(metas)
+		metaIndexes[messageIndex{msg.GUID, 0}] = len(metas) - 1
 
 		isRead = msg.IsRead || msg.IsFromMe || (unreadThreshold >= 0 && time.Since(msg.Time) > unreadThreshold)
 	}
@@ -349,7 +355,7 @@ func (portal *Portal) sendBackfillToMatrixServer(batchSending, forward, forwardI
 			// Fill reply metadata for messages we just sent
 			if meta.ReplyToGUID != "" && !meta.ReplyProcessed {
 				replyIndex, ok := metaIndexes[messageIndex{meta.ReplyToGUID, meta.ReplyToPart}]
-				if ok && replyIndex > 0 && replyIndex < len(eventIDs) && len(eventIDs[replyIndex]) > 0 {
+				if ok && replyIndex >= 0 && replyIndex < len(eventIDs) && len(eventIDs[replyIndex]) > 0 {
 					evt.Content.AsMessage().RelatesTo = (&event.RelatesTo{}).SetReplyTo(eventIDs[replyIndex])
 				}
 			}

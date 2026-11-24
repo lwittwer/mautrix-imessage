@@ -61,6 +61,19 @@ type GroupCreationWithMessageAPI interface {
 	CreateGroupWithMessage(guids []string, initialMessage string) (*CreateGroupResponse, error)
 }
 
+type GroupAdminAPI interface {
+	SetGroupName(chatID, name string) error
+	AddGroupParticipant(chatID, address string) error
+	RemoveGroupParticipant(chatID, address string) error
+	SetGroupAvatar(chatID, filename string, data []byte) error
+	RemoveGroupAvatar(chatID string) error
+	LeaveGroup(chatID string) error
+}
+
+type HealthAPI interface {
+	GetHealth() *ConnectorHealth
+}
+
 type API interface {
 	Start(readyCallback func()) error
 	Stop()

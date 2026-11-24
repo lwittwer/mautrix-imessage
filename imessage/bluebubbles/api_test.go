@@ -24,10 +24,11 @@ import (
 )
 
 type fakeBridge struct {
-	cfg      *imessage.PlatformConfig
-	zlog     zerolog.Logger
-	mu       sync.Mutex
-	statuses []imessage.BridgeStatus
+	cfg           *imessage.PlatformConfig
+	zlog          zerolog.Logger
+	mu            sync.Mutex
+	statuses      []imessage.BridgeStatus
+	messagesSince map[string][]string
 }
 
 func newFakeBridge(url, password string) *fakeBridge {
@@ -55,8 +56,15 @@ func (f *fakeBridge) SendBridgeStatus(state imessage.BridgeStatus) {
 	f.mu.Unlock()
 }
 func (f *fakeBridge) ReIDPortal(oldGUID, newGUID string, mergeExisting bool) bool { return false }
-func (f *fakeBridge) GetMessagesSince(chatGUID string, since time.Time) []string  { return nil }
-func (f *fakeBridge) SetPushKey(req *imessage.PushKeyRequest)                     {}
+func (f *fakeBridge) GetMessagesSince(chatGUID string, since time.Time) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.messagesSince == nil {
+		return nil
+	}
+	return append([]string(nil), f.messagesSince[chatGUID]...)
+}
+func (f *fakeBridge) SetPushKey(req *imessage.PushKeyRequest) {}
 
 func (f *fakeBridge) getStatuses() []imessage.BridgeStatus {
 	f.mu.Lock()
@@ -1144,5 +1152,485 @@ func TestUpdatedMessageStatusDoesNotDownloadAttachments(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected delivered status event on MessageStatusChan")
+	}
+}
+
+func TestHealthReportingAndHelperDisconnected(t *testing.T) {
+	var mode atomic.Int32 // 0 = healthy, 1 = helper disconnected, 2 = server 500
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/server/info" {
+			http.NotFound(w, r)
+			return
+		}
+		switch mode.Load() {
+		case 0:
+			helperTrue := true
+			_ = json.NewEncoder(w).Encode(ServerInfoResponse{
+				Status: 200,
+				Data: ServerInfo{
+					ServerVersion:   "1.9.7",
+					OSVersion:       "15.3.1",
+					ProxyService:    "Cloudflare",
+					PrivateAPI:      true,
+					HelperConnected: &helperTrue,
+				},
+			})
+		case 1:
+			helperFalse := false
+			_ = json.NewEncoder(w).Encode(ServerInfoResponse{
+				Status: 200,
+				Data: ServerInfo{
+					ServerVersion:   "1.9.7",
+					OSVersion:       "15.3.1",
+					PrivateAPI:      true,
+					HelperConnected: &helperFalse,
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("server unreachable"))
+		}
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+	bb.wsConnected.Store(true)
+	bb.connectedSince.Store(time.Now().Add(-5 * time.Minute).UnixNano())
+	bb.lastEventAt.Store(time.Now().Add(-10 * time.Second).UnixNano())
+	bb.reconnectCount.Store(2)
+
+	h := bb.GetHealth()
+	if h.ServerVersion != "1.9.7" || h.OSVersion != "15.3.1" || h.ProxyService != "Cloudflare" {
+		t.Fatalf("unexpected server metadata: %+v", h)
+	}
+	if !h.PrivateAPI || h.HelperConnected == nil || !*h.HelperConnected {
+		t.Fatalf("expected PrivateAPI=true and HelperConnected=true, got %+v", h)
+	}
+	if !h.WSConnected || h.ReconnectCount != 2 || h.LastEventAt.IsZero() || h.ServerInfoErr != "" {
+		t.Fatalf("unexpected websocket/health state: %+v", h)
+	}
+
+	// Simulate Private API helper detached from Messages.app
+	mode.Store(1)
+	h2 := bb.GetHealth()
+	if !h2.PrivateAPI || h2.HelperConnected == nil || *h2.HelperConnected {
+		t.Fatalf("expected PrivateAPI=true and HelperConnected=false, got %+v", h2)
+	}
+
+	// Simulate transient server/info outage: ServerInfoErr populated, cached info preserved
+	mode.Store(2)
+	h3 := bb.GetHealth()
+	if h3.ServerInfoErr == "" || h3.ServerVersion != "1.9.7" {
+		t.Fatalf("expected ServerInfoErr with cached version preserved, got %+v", h3)
+	}
+}
+
+func TestReconnectCatchUpSync(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	var connCount atomic.Int32
+	var seenAttachmentDownloads atomic.Int32
+	var missedAttachmentDownloads atomic.Int32
+
+	nowMs := time.Now().UnixMilli()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/server/info":
+			helperTrue := true
+			_ = json.NewEncoder(w).Encode(ServerInfoResponse{
+				Status: 200,
+				Data:   ServerInfo{PrivateAPI: true, HelperConnected: &helperTrue, ServerVersion: "1.9.7"},
+			})
+		case "/api/v1/contact":
+			_ = json.NewEncoder(w).Encode(ContactResponse{Status: 200, Data: []Contact{}})
+		case "/api/v1/chat/query":
+			_ = json.NewEncoder(w).Encode(ChatQueryResponse{
+				Status: 200,
+				Data: []Chat{
+					{GUID: "iMessage;-;+15551111111", LastMessage: &Message{GUID: "msg-missed-2", DateCreated: nowMs}},
+					{GUID: "any;-;+15552222222", LastMessage: &Message{GUID: "msg-newchat-1", DateCreated: nowMs}},
+				},
+				Metadata: PageMetadata{Total: 2, Limit: 1000, Offset: 0, Count: 2},
+			})
+		case "/api/v1/chat/iMessage;-;+15551111111/message":
+			// Returned in DESC order (newest first), as BlueBubbles does.
+			_ = json.NewEncoder(w).Encode(MessageQueryResponse{
+				Status: 200,
+				Data: []Message{
+					{
+						GUID:        "msg-missed-2",
+						DateCreated: nowMs - 1000,
+						Text:        "missed while offline",
+						Handle:      Handle{Address: "+15551111111", Service: "iMessage"},
+						Attachments: []Attachment{{GUID: "att-missed", TransferName: "doc.txt", MimeType: "text/plain"}},
+					},
+					{
+						GUID:        "msg-seen-edited",
+						DateCreated: nowMs - 2000,
+						DateEdited:  nowMs - 500,
+						Text:        "edited while offline",
+						Handle:      Handle{Address: "+15551111111", Service: "iMessage"},
+					},
+					{
+						GUID:        "msg-already-seen",
+						DateCreated: nowMs - 3000,
+						Text:        "already bridged",
+						Handle:      Handle{Address: "+15551111111", Service: "iMessage"},
+						Attachments: []Attachment{{GUID: "att-seen", TransferName: "old.jpg", MimeType: "image/jpeg"}},
+					},
+				},
+				Metadata: PageMetadata{Total: 3, Limit: 100, Offset: 0, Count: 3},
+			})
+		case "/api/v1/chat/any;-;+15552222222/message":
+			_ = json.NewEncoder(w).Encode(MessageQueryResponse{
+				Status: 200,
+				Data: []Message{
+					{
+						GUID:        "msg-newchat-1",
+						DateCreated: nowMs - 500,
+						Text:        "hello from rcs/any chat",
+						Handle:      Handle{Address: "+15552222222", Service: "RCS"},
+					},
+				},
+				Metadata: PageMetadata{Total: 1, Limit: 100, Offset: 0, Count: 1},
+			})
+		case "/api/v1/attachment/att-seen":
+			seenAttachmentDownloads.Add(1)
+			http.NotFound(w, r)
+		case "/api/v1/attachment/att-missed":
+			missedAttachmentDownloads.Add(1)
+			_ = json.NewEncoder(w).Encode(AttachmentResponse{
+				Status: 200,
+				Data:   Attachment{GUID: "att-missed", TransferName: "doc.txt", MimeType: "text/plain"},
+			})
+		case "/api/v1/attachment/att-missed/download":
+			_, _ = w.Write([]byte("missed-bytes"))
+		case "/socket.io/":
+			ws, err := upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer ws.Close()
+			_, _, _ = ws.ReadMessage()
+			_ = ws.WriteMessage(websocket.TextMessage, []byte(`0{"sid":"abc","pingInterval":25000,"pingTimeout":20000}`))
+			_ = ws.WriteMessage(websocket.TextMessage, []byte(`40`))
+			if connCount.Add(1) == 1 {
+				time.Sleep(20 * time.Millisecond)
+				_ = ws.WriteMessage(websocket.TextMessage, []byte(`41`))
+				return
+			}
+			for {
+				if _, _, err := ws.ReadMessage(); err != nil {
+					return
+				}
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	bb, fb := newTestConnector(t, srv.URL)
+	fb.messagesSince = map[string][]string{
+		"iMessage;-;+15551111111": {"msg-already-seen", "msg-seen-edited"},
+	}
+	bb.reconnectBaseDelay = 15 * time.Millisecond
+	bb.reconnectMaxDelay = 30 * time.Millisecond
+	bb.catchUpOverlap = 5 * time.Minute
+
+	ready := make(chan struct{})
+	if err := bb.Start(func() { close(ready) }); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer bb.Stop()
+	<-ready
+
+	got := make(map[string]*imessage.Message)
+	var order []string
+	deadline := time.After(3 * time.Second)
+	for len(got) < 3 {
+		select {
+		case msg := <-bb.MessageChan():
+			got[msg.GUID] = msg
+			order = append(order, msg.GUID)
+			for _, att := range msg.Attachments {
+				if att != nil && att.PathOnDisk != "" {
+					defer os.Remove(att.PathOnDisk)
+				}
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for catch-up messages, got=%v", order)
+		}
+	}
+
+	if _, sawDup := got["msg-already-seen"]; sawDup {
+		t.Fatal("already-seen message should have been skipped during catch-up")
+	}
+	if seenAttachmentDownloads.Load() != 0 {
+		t.Fatalf("expected 0 attachment downloads for already-seen message, got %d", seenAttachmentDownloads.Load())
+	}
+	if missedAttachmentDownloads.Load() != 1 {
+		t.Fatalf("expected 1 attachment download for missed message, got %d", missedAttachmentDownloads.Load())
+	}
+
+	missed := got["msg-missed-2"]
+	if missed == nil || missed.ChatGUID != "iMessage;-;+15551111111" || len(missed.Attachments) != 1 || !missed.Attachments[0].IsTemp {
+		t.Fatalf("unexpected missed message: %+v", missed)
+	}
+	edited := got["msg-seen-edited"]
+	if edited == nil || !edited.IsEdited || edited.Text != "edited while offline" {
+		t.Fatalf("expected missed edit to be replayed, got %+v", edited)
+	}
+	newChatMsg := got["msg-newchat-1"]
+	if newChatMsg == nil || newChatMsg.ChatGUID != "any;-;+15552222222" || newChatMsg.Service != "RCS" {
+		t.Fatalf("unexpected new-chat catch-up message: %+v", newChatMsg)
+	}
+
+	// Verify chronological order within the first chat (msg-seen-edited before msg-missed-2)
+	if order[0] != "msg-seen-edited" || order[1] != "msg-missed-2" {
+		t.Fatalf("expected chronological order [msg-seen-edited, msg-missed-2, ...], got %v", order)
+	}
+
+	// Wait briefly for health stats update
+	waitDeadline := time.Now().Add(time.Second)
+	for time.Now().Before(waitDeadline) {
+		h := bb.GetHealth()
+		if !h.LastCatchUpAt.IsZero() && h.LastCatchUpChats == 2 && h.LastCatchUpMsgs == 3 && h.LastCatchUpErr == "" {
+			return
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	t.Fatalf("expected catch-up health telemetry to record 2 chats / 3 msgs, got %+v", bb.GetHealth())
+}
+
+func TestBackfillQueriesIncludeChatAndFallback(t *testing.T) {
+	var withParam string
+	var pageCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/chat/iMessage;-;+15551234567/message" {
+			withParam = r.URL.Query().Get("with")
+			call := pageCalls.Add(1)
+			if call == 1 {
+				// Intentionally omit `chats` on returned messages to verify chatID fallback,
+				// and return Total > Count with Limit=0 to verify pagination loop guard.
+				_ = json.NewEncoder(w).Encode(MessageQueryResponse{
+					Status: 200,
+					Data: []Message{
+						{GUID: "m-2", DateCreated: 1700000002000, Text: "second", Handle: Handle{Address: "+15551234567", Service: "iMessage"}},
+						{GUID: "m-1", DateCreated: 1700000001000, Text: "first", Handle: Handle{Address: "+15551234567", Service: "iMessage"}},
+					},
+					Metadata: PageMetadata{Total: 10, Limit: 0, Offset: 0, Count: 2},
+				})
+				return
+			}
+			t.Errorf("unexpected extra pagination call #%d when Limit=0", call)
+			http.Error(w, "infinite pagination", http.StatusInternalServerError)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+	msgs, err := bb.GetMessagesWithLimit("iMessage;-;+15551234567", 50, "bf-1")
+	if err != nil {
+		t.Fatalf("GetMessagesWithLimit failed: %v", err)
+	}
+	if !strings.Contains(","+withParam+",", ",chat,") {
+		t.Fatalf("expected 'chat' in with query param, got %q", withParam)
+	}
+	if len(msgs) != 2 || msgs[0].GUID != "m-1" || msgs[1].GUID != "m-2" || msgs[0].ChatGUID != "iMessage;-;+15551234567" {
+		t.Fatalf("unexpected backfilled messages: %+v", msgs)
+	}
+
+	// Verify pagination guard on GetMessagesSinceDate when server returns Limit=0
+	pageCalls.Store(0)
+	msgs2, err := bb.GetMessagesSinceDate("iMessage;-;+15551234567", time.UnixMilli(1700000000000), "bf-2")
+	if err != nil || len(msgs2) != 2 {
+		t.Fatalf("GetMessagesSinceDate failed: msgs=%d err=%v", len(msgs2), err)
+	}
+}
+
+func TestSequoiaAnyChatResolution(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/handle/+15551112222":
+			_ = json.NewEncoder(w).Encode(ResolveIdentifierResponse{
+				Status: 200,
+				Data:   Handle{Address: "+15551112222", Service: "iMessage"},
+			})
+		case "/api/v1/chat/any;-;+15551112222":
+			_ = json.NewEncoder(w).Encode(ChatResponse{
+				Status: 200,
+				Data:   &Chat{GUID: "any;-;+15551112222"},
+			})
+		case "/api/v1/handle/+15553334444":
+			_ = json.NewEncoder(w).Encode(ResolveIdentifierResponse{
+				Status: 200,
+				Data:   Handle{Address: "+15553334444", Service: "RCS"},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"status":404,"message":"not found"}`))
+		}
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+
+	// Existing Sequoia any;-; chat is reused
+	gotAny, err := bb.ResolveIdentifier("+15551112222")
+	if err != nil || gotAny != "any;-;+15551112222" {
+		t.Fatalf("expected any;-;+15551112222, got %q (err=%v)", gotAny, err)
+	}
+
+	// No any;-; chat -> falls back to handle's reported RCS service
+	gotRCS, err := bb.ResolveIdentifier("+15553334444")
+	if err != nil || gotRCS != "RCS;-;+15553334444" {
+		t.Fatalf("expected RCS;-;+15553334444, got %q (err=%v)", gotRCS, err)
+	}
+}
+
+func TestGroupAdminAPIAndRenameEchoSuppression(t *testing.T) {
+	var (
+		mu             sync.Mutex
+		gotRename      UpdateChatRequest
+		gotAdded       ChatParticipantRequest
+		gotRemoved     ChatParticipantRequest
+		gotIconName    string
+		gotIconDeleted bool
+		gotLeft        bool
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/chat/iMessage;+;chat123":
+			mu.Lock()
+			_ = json.NewDecoder(r.Body).Decode(&gotRename)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(GenericResponse{Status: 200, Message: "ok"})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/chat/iMessage;+;chat123/participant/add":
+			mu.Lock()
+			_ = json.NewDecoder(r.Body).Decode(&gotAdded)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(GenericResponse{Status: 200, Message: "ok"})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/chat/iMessage;+;chat123/participant/remove":
+			mu.Lock()
+			_ = json.NewDecoder(r.Body).Decode(&gotRemoved)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(GenericResponse{Status: 200, Message: "ok"})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/chat/iMessage;+;chat123/icon":
+			_ = r.ParseMultipartForm(10 << 20)
+			_, fh, err := r.FormFile("icon")
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			gotIconName = fh.Filename
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(GenericResponse{Status: 200, Message: "ok"})
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/chat/iMessage;+;chat123/icon":
+			mu.Lock()
+			gotIconDeleted = true
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(GenericResponse{Status: 200, Message: "ok"})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/chat/iMessage;+;chat123/leave":
+			mu.Lock()
+			gotLeft = true
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(GenericResponse{Status: 200, Message: "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+
+	// Without Private API -> ErrUnsupported
+	bb.usingPrivateAPI.Store(false)
+	if bb.Capabilities().GroupAdmin {
+		t.Fatal("expected GroupAdmin capability to be false without Private API")
+	}
+	if err := bb.SetGroupName("iMessage;+;chat123", "New Name"); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("expected ErrUnsupported without Private API, got %v", err)
+	}
+
+	bb.usingPrivateAPI.Store(true)
+	if !bb.Capabilities().GroupAdmin {
+		t.Fatal("expected GroupAdmin capability to be true with Private API")
+	}
+
+	// Rejects DMs and SMS groups
+	if err := bb.SetGroupName("iMessage;-;+15551234567", "DM"); err == nil {
+		t.Fatal("expected error renaming a DM")
+	}
+	if err := bb.SetGroupName("SMS;+;chat123", "SMS Group"); err == nil {
+		t.Fatal("expected error renaming an SMS group")
+	}
+
+	// Rename + echo suppression
+	if err := bb.SetGroupName("iMessage;+;chat123", "Weekend Trip"); err != nil {
+		t.Fatalf("SetGroupName failed: %v", err)
+	}
+	if gotRename.DisplayName != "Weekend Trip" {
+		t.Fatalf("unexpected rename payload: %+v", gotRename)
+	}
+	renameEcho := json.RawMessage(`{"guid":"rn-1","itemType":2,"groupTitle":"Weekend Trip","dateCreated":1700000000000,"chats":[{"guid":"iMessage;+;chat123"}]}`)
+	if err := bb.handleNewMessage(renameEcho); err != nil {
+		t.Fatalf("handleNewMessage rename echo failed: %v", err)
+	}
+	select {
+	case msg := <-bb.MessageChan():
+		t.Fatalf("expected Matrix-initiated group rename echo to be suppressed, got %+v", msg)
+	default:
+	}
+
+	// Another rename from iMessage should still come through
+	remoteRename := json.RawMessage(`{"guid":"rn-2","itemType":2,"groupTitle":"Beach Trip","dateCreated":1700000001000,"chats":[{"guid":"iMessage;+;chat123"}]}`)
+	if err := bb.handleNewMessage(remoteRename); err != nil {
+		t.Fatalf("handleNewMessage remote rename failed: %v", err)
+	}
+	select {
+	case msg := <-bb.MessageChan():
+		if msg.ItemType != imessage.ItemTypeName || msg.NewGroupName != "Beach Trip" {
+			t.Fatalf("unexpected remote rename message: %+v", msg)
+		}
+	default:
+		t.Fatal("expected remote group rename to reach MessageChan")
+	}
+
+	// Add / Remove participant (including address normalization)
+	if err := bb.AddGroupParticipant("iMessage;+;chat123", "(555) 222-3333"); err != nil {
+		t.Fatalf("AddGroupParticipant failed: %v", err)
+	}
+	if gotAdded.Address != "+5552223333" {
+		t.Fatalf("unexpected added address: %+v", gotAdded)
+	}
+	if err := bb.RemoveGroupParticipant("iMessage;+;chat123", "iMessage;-;alice@example.com"); err != nil {
+		t.Fatalf("RemoveGroupParticipant failed: %v", err)
+	}
+	if gotRemoved.Address != "alice@example.com" {
+		t.Fatalf("unexpected removed address: %+v", gotRemoved)
+	}
+
+	// Set / Remove group avatar and LeaveGroup
+	if err := bb.SetGroupAvatar("iMessage;+;chat123", "group.png", []byte("png-data")); err != nil {
+		t.Fatalf("SetGroupAvatar failed: %v", err)
+	}
+	if gotIconName != "group.png" {
+		t.Fatalf("expected group.png icon upload, got %q", gotIconName)
+	}
+	if err := bb.RemoveGroupAvatar("iMessage;+;chat123"); err != nil {
+		t.Fatalf("RemoveGroupAvatar failed: %v", err)
+	}
+	if !gotIconDeleted {
+		t.Fatal("expected group icon DELETE call")
+	}
+	if err := bb.LeaveGroup("iMessage;+;chat123"); err != nil {
+		t.Fatalf("LeaveGroup failed: %v", err)
+	}
+	if !gotLeft {
+		t.Fatal("expected group leave POST call")
 	}
 }

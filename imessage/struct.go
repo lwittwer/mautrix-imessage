@@ -168,6 +168,7 @@ type Attachment struct {
 	FileName      string `json:"file_name"`
 	MimeType      string `json:"mime_type,omitempty"`
 	DownloadError string `json:"-"`
+	IsTemp        bool   `json:"-"`
 	triedMagic    bool
 }
 
@@ -236,11 +237,21 @@ func ParseIdentifier(guid string) Identifier {
 		return Identifier{}
 	}
 	parts := strings.Split(guid, ";")
+	if len(parts) < 3 {
+		return Identifier{LocalID: guid}
+	}
 	return Identifier{
 		Service: parts[0],
 		IsGroup: parts[1] == "+",
 		LocalID: parts[2],
 	}
+}
+
+func IsResolvedChatGUID(s string) bool {
+	return strings.HasPrefix(s, "iMessage;-;") ||
+		strings.HasPrefix(s, "SMS;-;") ||
+		strings.HasPrefix(s, "RCS;-;") ||
+		strings.HasPrefix(s, "any;-;")
 }
 
 func (id Identifier) String() string {
@@ -276,12 +287,32 @@ type ConnectorCapabilities struct {
 	SendCaptions             bool
 	UnsendMessages           bool
 	EditMessages             bool
+	GroupAdmin               bool
 	BridgeState              bool
 	MessageStatusCheckpoints bool
 	DeliveredStatus          bool
 	ContactChatMerging       bool
 	RichLinks                bool
 	ChatBridgeResult         bool
+}
+
+type ConnectorHealth struct {
+	ServerVersion     string
+	OSVersion         string
+	ProxyService      string
+	PrivateAPI        bool
+	HelperConnected   *bool
+	WSConnected       bool
+	ConnectedSince    time.Time
+	DisconnectedSince time.Time
+	LastEventAt       time.Time
+	ReconnectCount    int64
+	LastDisconnectErr string
+	LastCatchUpAt     time.Time
+	LastCatchUpChats  int
+	LastCatchUpMsgs   int
+	LastCatchUpErr    string
+	ServerInfoErr     string
 }
 
 type PushKeyRequest struct {
