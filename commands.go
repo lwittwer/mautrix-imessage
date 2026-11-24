@@ -17,6 +17,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -38,7 +39,13 @@ type WrappedCommandEvent struct {
 func (br *IMBridge) RegisterCommands() {
 	proc := br.CommandProcessor.(*commands.Processor)
 	proc.AddHandlers(
+		commands.CommandLoginMatrix,
+		commands.CommandLogoutMatrix,
+		commands.CommandDiscardMegolmSession,
+		commands.CommandSetPowerLevel,
 		cmdPM,
+		cmdCreateGroup,
+		cmdSync,
 		cmdSearchContacts,
 		cmdRefreshContacts,
 	)
@@ -107,13 +114,18 @@ func fnSearchContacts(ce *WrappedCommandEvent) {
 		return
 	}
 
-	// TODO trim whitespace from args first
-	contacts, err := ce.Bridge.IM.SearchContactList(ce.RawArgs)
+	searchTerm := strings.TrimSpace(ce.RawArgs)
+	if searchTerm == "" {
+		ce.Reply("**Usage:** `search-contacts <search terms>`")
+		return
+	}
+
+	contacts, err := ce.Bridge.IM.SearchContactList(searchTerm)
 	if err != nil {
 		ce.Reply("Failed to search contacts: %s", err)
 	} else {
-		if contacts == nil || len(contacts) == 0 {
-			ce.Reply("No contacts found for search `%s`", ce.RawArgs)
+		if len(contacts) == 0 {
+			ce.Reply("No contacts found for search `%s`", searchTerm)
 		} else {
 			replyMessage := fmt.Sprintf("Found %d contacts:\n", len(contacts))
 
@@ -165,12 +177,162 @@ var cmdRefreshContacts = &commands.FullHandler{
 }
 
 func fnRefreshContacts(ce *WrappedCommandEvent) {
-	ce.Bridge.ZLog.Trace().Interface("args", ce.Args).Str("cmd", ce.Command).Msg("fnSearchContacts")
+	ce.Bridge.ZLog.Trace().Interface("args", ce.Args).Str("cmd", ce.Command).Msg("fnRefreshContacts")
 
 	err := ce.Bridge.IM.RefreshContactList()
 	if err != nil {
-		ce.Reply("Failed to search contacts: %s", err)
+		ce.Reply("Failed to refresh contacts: %s", err)
 	} else {
-		ce.Reply("Contacts List updated!")
+		ce.Reply("Contacts list updated!")
 	}
+}
+
+var cmdCreateGroup = &commands.FullHandler{
+	Func: wrapCommand(fnCreateGroup),
+	Name: "create-group",
+	Help: commands.HelpMeta{
+		Section:     HelpSectionManagingPortals,
+		Description: "Creates a new group chat with the specified phone numbers or email addresses (and initial message for BlueBubbles).",
+		Args:        "<_address1_> <_address2_> [...] [-- <_initial message_>]",
+	},
+	RequiresPortal: false,
+	RequiresLogin:  false,
+}
+
+func parseCreateGroupArgs(rawArgs string) (addresses []string, initialMessage string) {
+	trimmed := strings.TrimSpace(rawArgs)
+	if trimmed == "" {
+		return nil, ""
+	}
+	// Split on standalone "--" separator to preserve spacing in the initial message.
+	var addrPart string
+	if idx := strings.Index(trimmed, " -- "); idx >= 0 {
+		addrPart = trimmed[:idx]
+		initialMessage = strings.TrimSpace(trimmed[idx+4:])
+	} else if strings.HasSuffix(trimmed, " --") {
+		addrPart = strings.TrimSuffix(trimmed, " --")
+	} else if trimmed == "--" {
+		return nil, ""
+	} else {
+		addrPart = trimmed
+	}
+	addresses = strings.Fields(addrPart)
+	return addresses, initialMessage
+}
+
+func fnCreateGroup(ce *WrappedCommandEvent) {
+	ce.Bridge.ZLog.Trace().Interface("args", ce.Args).Str("cmd", ce.Command).Msg("fnCreateGroup")
+
+	addresses, initialMessage := parseCreateGroupArgs(ce.RawArgs)
+	withMsgAPI, needsInitialMessage := ce.Bridge.IM.(imessage.GroupCreationWithMessageAPI)
+
+	if len(addresses) < 2 || (needsInitialMessage && initialMessage == "") {
+		if needsInitialMessage {
+			ce.Reply("**Usage:** `create-group <address1> <address2> [...] -- <initial message>`")
+		} else {
+			ce.Reply("**Usage:** `create-group <address1> <address2> [...]`")
+		}
+		return
+	}
+
+	guids := make([]string, len(addresses))
+	for i, identifier := range addresses {
+		if strings.HasPrefix(identifier, "iMessage;-;") || strings.HasPrefix(identifier, "SMS;-;") {
+			guids[i] = identifier
+		} else {
+			resolved, err := ce.Bridge.IM.ResolveIdentifier(identifier)
+			if err != nil {
+				ce.Reply("Failed to resolve identifier `%s`: %s", identifier, err)
+				return
+			}
+			guids[i] = resolved
+		}
+	}
+
+	var createResp *imessage.CreateGroupResponse
+	var err error
+	if needsInitialMessage {
+		createResp, err = withMsgAPI.CreateGroupWithMessage(guids, initialMessage)
+	} else {
+		createResp, err = ce.Bridge.IM.CreateGroup(guids)
+	}
+	if err != nil {
+		ce.Reply("Failed to create group: %s", err)
+		return
+	}
+
+	var initialMsgWarning string
+	if !needsInitialMessage && initialMessage != "" {
+		if _, sendErr := ce.Bridge.IM.SendMessage(createResp.GUID, initialMessage, "", 0, nil, nil); sendErr != nil {
+			initialMsgWarning = fmt.Sprintf(" (failed to send initial message: %s)", sendErr)
+		}
+	}
+
+	portal := ce.Bridge.GetPortalByGUID(createResp.GUID)
+	portal.roomCreateLock.Lock()
+	alreadyExists := len(portal.MXID) > 0
+	if !alreadyExists && createResp.ThreadID != "" {
+		portal.ThreadID = createResp.ThreadID
+	}
+	roomID := portal.MXID
+	portal.roomCreateLock.Unlock()
+
+	if !alreadyExists {
+		if err = portal.CreateMatrixRoom(nil, nil); err != nil {
+			ce.Reply("Created iMessage group `%s`, but failed to create Matrix room: %s", createResp.GUID, err)
+			return
+		}
+		roomID = portal.MXID
+		ce.Reply("Group portal room [%s](%s) is ready.%s", roomID, roomID.URI(ce.Bridge.Config.Homeserver.Domain).MatrixToURL(), initialMsgWarning)
+	} else {
+		ce.Reply("Group portal room [%s](%s) already exists.%s", roomID, roomID.URI(ce.Bridge.Config.Homeserver.Domain).MatrixToURL(), initialMsgWarning)
+	}
+}
+
+var cmdSync = &commands.FullHandler{
+	Func: wrapCommand(fnSync),
+	Name: "sync",
+	Help: commands.HelpMeta{
+		Section:     HelpSectionManagingPortals,
+		Description: "Refreshes contacts and attempts to resync existing portal rooms and metadata.",
+	},
+	RequiresPortal: false,
+	RequiresLogin:  false,
+}
+
+func fnSync(ce *WrappedCommandEvent) {
+	ce.Bridge.ZLog.Trace().Str("cmd", ce.Command).Msg("fnSync")
+
+	if !ce.Bridge.syncInProgress.CompareAndSwap(false, true) {
+		ce.Reply("A sync is already in progress.")
+		return
+	}
+
+	ce.Reply("Syncing contacts and portals…")
+
+	go func() {
+		defer ce.Bridge.syncInProgress.Store(false)
+
+		var contactStatus string
+		if err := ce.Bridge.IM.RefreshContactList(); err != nil {
+			if errors.Is(err, errors.ErrUnsupported) {
+				contactStatus = "Contact list refresh is not supported by this connector."
+			} else {
+				ce.Bridge.ZLog.Warn().Err(err).Msg("Failed to refresh contact list during manual sync")
+				contactStatus = fmt.Sprintf("Failed to refresh contact list: %s.", err)
+			}
+		} else {
+			contactStatus = "Contact list refreshed."
+		}
+
+		portals := ce.Bridge.GetAllPortals()
+		attempted := 0
+		for _, portal := range portals {
+			if len(portal.MXID) > 0 {
+				portal.Sync(false)
+				attempted++
+			}
+		}
+		ce.Reply("%s Attempted sync for %d portal rooms.", contactStatus, attempted)
+	}()
 }

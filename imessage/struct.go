@@ -163,11 +163,12 @@ func (contact *Contact) Name() string {
 }
 
 type Attachment struct {
-	GUID       string `json:"guid,omitempty"`
-	PathOnDisk string `json:"path_on_disk"`
-	FileName   string `json:"file_name"`
-	MimeType   string `json:"mime_type,omitempty"`
-	triedMagic bool
+	GUID          string `json:"guid,omitempty"`
+	PathOnDisk    string `json:"path_on_disk"`
+	FileName      string `json:"file_name"`
+	MimeType      string `json:"mime_type,omitempty"`
+	DownloadError string `json:"-"`
+	triedMagic    bool
 }
 
 func (attachment *Attachment) GetMimeType() string {
@@ -191,6 +192,9 @@ func (attachment *Attachment) GetFileName() string {
 }
 
 func (attachment *Attachment) Read() ([]byte, error) {
+	if attachment.DownloadError != "" {
+		return nil, fmt.Errorf("failed to download attachment: %s", attachment.DownloadError)
+	}
 	if strings.HasPrefix(attachment.PathOnDisk, "~/") {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -266,6 +270,7 @@ type CreateGroupResponse struct {
 type ConnectorCapabilities struct {
 	MessageSendResponses     bool
 	SendTapbacks             bool
+	SendCustomEmojiTapbacks  bool
 	SendReadReceipts         bool
 	SendTypingNotifications  bool
 	SendCaptions             bool

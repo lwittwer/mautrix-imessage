@@ -33,6 +33,7 @@ import (
 
 var (
 	ErrNotLoggedIn = errors.New("you're not logged into iMessage")
+	ErrSendTimeout = errors.New("timed out waiting for remote server response; message may still be delivered")
 )
 
 type ContactAPI interface {
@@ -50,6 +51,14 @@ type ChatInfoAPI interface {
 type VenturaFeatures interface {
 	UnsendMessage(chatID, targetGUID string, targetPart int) (*SendResponse, error)
 	EditMessage(chatID, targetGUID string, newText string, targetPart int) (*SendResponse, error)
+}
+
+type CustomEmojiTapbackAPI interface {
+	SendCustomEmojiTapback(chatID, targetGUID string, targetPart int, emoji string, remove bool) (*SendResponse, error)
+}
+
+type GroupCreationWithMessageAPI interface {
+	CreateGroupWithMessage(guids []string, initialMessage string) (*CreateGroupResponse, error)
 }
 
 type API interface {
