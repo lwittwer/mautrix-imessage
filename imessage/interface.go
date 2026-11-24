@@ -33,6 +33,7 @@ import (
 
 var (
 	ErrNotLoggedIn = errors.New("you're not logged into iMessage")
+	ErrSendTimeout = errors.New("timed out waiting for remote server response; message may still be delivered")
 )
 
 type ContactAPI interface {

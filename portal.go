@@ -1029,7 +1029,12 @@ func (portal *Portal) sendErrorMessage(evt *event.Event, rootErr error, humanRea
 			reason = event.MessageStatusUnsupported
 			msgStatusCode = event.MessageStatusFail
 		case status.MsgStatusTimeout:
-			reason = event.MessageStatusTooOld
+			if isCertain {
+				reason = event.MessageStatusTooOld
+			} else {
+				reason = event.MessageStatusNetworkError
+				msgStatusCode = event.MessageStatusPending
+			}
 		}
 
 		content := event.BeeperMessageStatusEventContent{
@@ -1156,15 +1161,31 @@ func (portal *Portal) sendSuccessMessageStatus(eventID id.EventID, service, hand
 }
 
 func (portal *Portal) addDedup(eventID id.EventID, body string) {
+	portal.messageDedupLock.Lock()
 	if portal.messageDedup != nil {
-		portal.messageDedupLock.Lock()
 		portal.messageDedup[strings.TrimSpace(body)] = SentMessage{
 			EventID: eventID,
 			// Set the timestamp to a bit before now to make sure the deduplication catches it properly
 			Timestamp: time.Now().Add(-10 * time.Second),
 		}
-		portal.messageDedupLock.Unlock()
 	}
+	portal.messageDedupLock.Unlock()
+}
+
+func (portal *Portal) addTimeoutDedup(eventID id.EventID, key string) {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" {
+		return
+	}
+	portal.messageDedupLock.Lock()
+	if portal.messageDedup == nil {
+		portal.messageDedup = make(map[string]SentMessage)
+	}
+	portal.messageDedup[trimmed] = SentMessage{
+		EventID:   eventID,
+		Timestamp: time.Now().Add(-10 * time.Second),
+	}
+	portal.messageDedupLock.Unlock()
 }
 
 func (portal *Portal) shouldHandleMessage(evt *event.Event) error {
@@ -1286,14 +1307,27 @@ func (portal *Portal) HandleMatrixMessage(evt *event.Event) {
 		portal.log.Errorln("Error sending to iMessage:", err)
 		statusCode := status.MsgStatusPermFailure
 		certain := false
+		humanReadable := ""
 		if errors.Is(err, ipc.ErrSizeLimitExceeded) {
 			certain = true
 			statusCode = status.MsgStatusUnsupported
+		} else if errors.Is(err, imessage.ErrSendTimeout) {
+			certain = false
+			statusCode = status.MsgStatusTimeout
+			humanReadable = "Timed out waiting for remote server response; message may still be delivered"
+			if !wasEdit {
+				dedupKey := msg.Body
+				if msg.FileName != "" {
+					dedupKey = msg.FileName
+				}
+				portal.addTimeoutDedup(evt.ID, dedupKey)
+			}
 		}
 		var ipcErr ipc.Error
 		if errors.As(err, &ipcErr) {
 			certain = true
 			err = errors.New(ipcErr.Message)
+			humanReadable = ipcErr.Message
 			switch ipcErr.Code {
 			case ipc.ErrUnsupportedError.Code:
 				statusCode = status.MsgStatusUnsupported
@@ -1301,7 +1335,7 @@ func (portal *Portal) HandleMatrixMessage(evt *event.Event) {
 				statusCode = status.MsgStatusTimeout
 			}
 		}
-		portal.sendErrorMessage(evt, err, ipcErr.Message, certain, statusCode, "")
+		portal.sendErrorMessage(evt, err, humanReadable, certain, statusCode, "")
 	} else if resp != nil {
 		portal.sendDeliveryReceipt(evt.ID, resp.Service, resp.ChatGUID, !portal.bridge.IM.Capabilities().MessageStatusCheckpoints)
 		if !wasEdit {
@@ -1713,17 +1747,19 @@ func (portal *Portal) UpdateAvatar(attachment *imessage.Attachment, intent *apps
 }
 
 func (portal *Portal) isDuplicate(dbMessage *database.Message, msg *imessage.Message) bool {
-	if portal.messageDedup == nil {
-		return false
-	}
 	dedupKey := msg.Text
-	if len(msg.Attachments) == 1 {
+	if len(msg.Attachments) == 1 && msg.Attachments[0] != nil {
 		dedupKey = msg.Attachments[0].FileName
 	}
 	portal.messageDedupLock.Lock()
-	dedup, isDup := portal.messageDedup[strings.TrimSpace(dedupKey)]
+	if portal.messageDedup == nil {
+		portal.messageDedupLock.Unlock()
+		return false
+	}
+	trimmedKey := strings.TrimSpace(dedupKey)
+	dedup, isDup := portal.messageDedup[trimmedKey]
 	if isDup {
-		delete(portal.messageDedup, dedupKey)
+		delete(portal.messageDedup, trimmedKey)
 		portal.messageDedupLock.Unlock()
 		portal.log.Debugfln("Received echo for Matrix message %s -> %s", dedup.EventID, msg.GUID)
 		if !dedup.Timestamp.Before(msg.Time) {
@@ -2049,6 +2085,34 @@ func (portal *Portal) convertiMessage(msg *imessage.Message, intent *appservice.
 	return attachments
 }
 
+func (portal *Portal) convertEditediMessage(msg *imessage.Message, dbMessage *database.Message, intent *appservice.IntentAPI) []*ConvertedMessage {
+	// When attachments and caption are bridged as separate events (caption_in_message: false,
+	// or 2+ attachments), target only the stored caption event instead of re-uploading media.
+	isSingleCombinedCaption := len(msg.Attachments) == 1 && portal.bridge.Config.Bridge.CaptionInMessage
+	if len(msg.Attachments) > 0 && !isSingleCombinedCaption {
+		text := portal.convertIMText(msg)
+		if text == nil {
+			return nil
+		}
+		portal.addSourceMetadata(msg, text.Extra)
+		captionMsg := portal.bridge.DB.Message.GetByGUID(portal.GUID, msg.GUID, len(msg.Attachments))
+		if captionMsg == nil {
+			portal.log.Debugfln("Skipping edit for %s: no stored caption part at index %d", msg.GUID, len(msg.Attachments))
+			return nil
+		}
+		text.Content.SetEdit(captionMsg.MXID)
+		return []*ConvertedMessage{text}
+	}
+
+	parts := portal.convertiMessage(msg, intent)
+	if len(parts) == 1 {
+		parts[0].Content.SetEdit(dbMessage.MXID)
+		return parts
+	}
+	portal.log.Warnfln("Skipping edit for %s: converted into %d parts instead of 1", msg.GUID, len(parts))
+	return nil
+}
+
 func (portal *Portal) handleNormaliMessage(msg *imessage.Message, dbMessage *database.Message, intent *appservice.IntentAPI, mxid *id.EventID) {
 	if msg.Metadata != nil && portal.bridge.Config.HackyStartupTest.Key != "" {
 		if portal.bridge.Config.HackyStartupTest.EchoMode {
@@ -2064,16 +2128,19 @@ func (portal *Portal) handleNormaliMessage(msg *imessage.Message, dbMessage *dat
 		}
 	}
 
-	parts := portal.convertiMessage(msg, intent)
+	var parts []*ConvertedMessage
+	if mxid != nil {
+		parts = portal.convertEditediMessage(msg, dbMessage, intent)
+	} else {
+		parts = portal.convertiMessage(msg, intent)
+	}
 	if len(parts) == 0 {
-		portal.log.Warnfln("iMessage %s doesn't contain any attachments nor text", msg.GUID)
+		if mxid == nil {
+			portal.log.Warnfln("iMessage %s doesn't contain any attachments nor text", msg.GUID)
+		}
+		return
 	}
 	for index, converted := range parts {
-		if mxid != nil {
-			if len(parts) == 1 {
-				converted.Content.SetEdit(*mxid)
-			}
-		}
 		portal.log.Debugfln("Sending iMessage attachment %s.%d", msg.GUID, index)
 		resp, err := portal.sendMessage(intent, converted.Type, converted.Content, converted.Extra, dbMessage.Timestamp)
 		if err != nil {

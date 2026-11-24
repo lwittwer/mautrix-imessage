@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -222,10 +223,19 @@ func TestConvertBBMessageEdgeCases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(msg.Attachments) != 1 || msg.Attachments[0] == nil || msg.Attachments[0].FileName != "photo.jpg" {
-		t.Fatalf("expected 1 non-nil attachment, got %+v", msg.Attachments)
+	if len(msg.Attachments) != 2 {
+		t.Fatalf("expected 2 attachments preserving source part indices, got %d (%+v)", len(msg.Attachments), msg.Attachments)
 	}
-	defer os.Remove(msg.Attachments[0].PathOnDisk)
+	if msg.Attachments[0] == nil || msg.Attachments[0].GUID != "att-missing" || msg.Attachments[0].DownloadError == "" {
+		t.Fatalf("expected failed placeholder at index 0, got %+v", msg.Attachments[0])
+	}
+	if _, err := msg.Attachments[0].Read(); err == nil {
+		t.Fatal("expected Read() on failed attachment placeholder to return error")
+	}
+	if msg.Attachments[1] == nil || msg.Attachments[1].FileName != "photo.jpg" {
+		t.Fatalf("expected surviving attachment preserved at index 1, got %+v", msg.Attachments[1])
+	}
+	defer os.Remove(msg.Attachments[1].PathOnDisk)
 
 	if msg.ReplyToGUID != "reply-target-guid" || msg.ReplyToPart != 2 {
 		t.Fatalf("expected reply part 2, got guid=%q part=%d", msg.ReplyToGUID, msg.ReplyToPart)
@@ -978,5 +988,126 @@ func TestEditMessageSuppressesEchoWithoutDateEditedAndBeforeHTTPResponse(t *test
 	case msg := <-bb.messageChan:
 		t.Fatalf("expected echo after response omitting dateEdited to be suppressed, got %+v", msg)
 	default:
+	}
+}
+
+func TestCredentialSanitizationInErrors(t *testing.T) {
+	// Start and immediately close a local server to guarantee connection-refused *url.Error.
+	closedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	closedURL := closedSrv.URL
+	closedSrv.Close()
+
+	secret := "s3cr3t+pw&123"
+	escapedSecret := url.QueryEscape(secret)
+	fb := newFakeBridge(closedURL, secret)
+	api, err := NewBlueBubblesConnector(fb)
+	if err != nil {
+		t.Fatalf("NewBlueBubblesConnector failed: %v", err)
+	}
+	bb := api.(*blueBubbles)
+	bb.usingPrivateAPI.Store(true)
+
+	tmpFile := filepath.Join(t.TempDir(), "test.txt")
+	if err := os.WriteFile(tmpFile, []byte("hello"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	assertNoSecret := func(name string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: expected error against closed server, got nil", name)
+		}
+		msg := err.Error()
+		if strings.Contains(msg, secret) || strings.Contains(msg, escapedSecret) {
+			t.Fatalf("%s: error leaked BlueBubbles password: %s", name, msg)
+		}
+	}
+
+	assertNoSecret("RefreshContactList", bb.RefreshContactList())
+	_, err = bb.SendMessage("iMessage;-;+15551234567", "hi", "", 0, nil, nil)
+	assertNoSecret("SendMessage", err)
+	_, err = bb.SendFile("iMessage;-;+15551234567", "", "test.txt", tmpFile, "", 0, "text/plain", false, nil)
+	assertNoSecret("SendFile", err)
+	_, err = bb.downloadAttachment("att-1")
+	assertNoSecret("downloadAttachment", err)
+	_, err = bb.connectToWebSocket()
+	assertNoSecret("connectToWebSocket", err)
+}
+
+func TestResolveIdentifierFirstContact404AndErrorPropagation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/handle/+15551112222":
+			_ = json.NewEncoder(w).Encode(ResolveIdentifierResponse{
+				Status: 200,
+				Data:   Handle{Address: "+15551112222", Service: "SMS"},
+			})
+		case "/api/v1/handle/+15559998888":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"status":404,"message":"Handle does not exist!"}`))
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"status":500,"message":"db locked"}`))
+		}
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+
+	// Known handle -> returns server-reported service
+	got, err := bb.ResolveIdentifier("+1 (555) 111-2222")
+	if err != nil || got != "SMS;-;+15551112222" {
+		t.Fatalf("expected SMS;-;+15551112222, got %q (err=%v)", got, err)
+	}
+
+	// Unknown first-contact handle (HTTP 404) -> falls back to iMessage
+	gotNew, err := bb.ResolveIdentifier("+15559998888")
+	if err != nil || gotNew != "iMessage;-;+15559998888" {
+		t.Fatalf("expected 404 fallback iMessage;-;+15559998888, got %q (err=%v)", gotNew, err)
+	}
+
+	// Non-404 error (HTTP 500) -> propagated
+	if _, err := bb.ResolveIdentifier("+15550000000"); err == nil || !strings.Contains(err.Error(), "HTTP 500") {
+		t.Fatalf("expected HTTP 500 error to propagate, got %v", err)
+	}
+}
+
+func TestSendTimeoutUsesSendClientAndPreservesUncertainty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/message/text" {
+			time.Sleep(80 * time.Millisecond)
+			_ = json.NewEncoder(w).Encode(SendTextResponse{
+				Status: 200,
+				Data:   Message{GUID: "slow-msg-1", DateCreated: 1700000000000},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	secret := "timeout-secret-pw"
+	fb := newFakeBridge(srv.URL, secret)
+	api, err := NewBlueBubblesConnector(fb)
+	if err != nil {
+		t.Fatalf("NewBlueBubblesConnector failed: %v", err)
+	}
+	bb := api.(*blueBubbles)
+
+	// SendMessage uses sendHTTPClient (300ms), NOT httpClient (30ms), so 80ms send succeeds.
+	bb.httpClient = &http.Client{Timeout: 30 * time.Millisecond}
+	bb.sendHTTPClient = &http.Client{Timeout: 300 * time.Millisecond}
+	if resp, err := bb.SendMessage("iMessage;-;+15551234567", "slow send", "", 0, nil, nil); err != nil || resp.GUID != "slow-msg-1" {
+		t.Fatalf("expected SendMessage to use sendHTTPClient timeout and succeed, got resp=%+v err=%v", resp, err)
+	}
+
+	// When sendHTTPClient itself times out, error wraps imessage.ErrSendTimeout and redacts password.
+	bb.sendHTTPClient = &http.Client{Timeout: 30 * time.Millisecond}
+	_, err = bb.SendMessage("iMessage;-;+15551234567", "too slow", "", 0, nil, nil)
+	if !errors.Is(err, imessage.ErrSendTimeout) {
+		t.Fatalf("expected ErrSendTimeout, got %v", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("timeout error leaked password: %s", err.Error())
 	}
 }

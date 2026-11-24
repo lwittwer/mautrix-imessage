@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -46,6 +47,7 @@ const (
 	IMessageAliasRemoved  string = "imessage-alias-removed"
 
 	defaultHTTPTimeout            = 30 * time.Second
+	defaultSendHTTPTimeout        = 2 * time.Minute
 	defaultMediaHTTPTimeout       = 2 * time.Minute
 	defaultWSReadTimeout          = 90 * time.Second
 	defaultWSWriteTimeout         = 15 * time.Second
@@ -95,6 +97,7 @@ type blueBubbles struct {
 	pendingEdits map[string]pendingEdit
 
 	httpClient      *http.Client
+	sendHTTPClient  *http.Client
 	mediaHTTPClient *http.Client
 	bbRequestLock   sync.Mutex
 
@@ -134,6 +137,7 @@ func NewBlueBubblesConnector(bridge imessage.Bridge) (imessage.API, error) {
 		pendingEdits:           make(map[string]pendingEdit),
 
 		httpClient:      &http.Client{Timeout: defaultHTTPTimeout},
+		sendHTTPClient:  &http.Client{Timeout: defaultSendHTTPTimeout},
 		mediaHTTPClient: &http.Client{Timeout: defaultMediaHTTPTimeout},
 
 		reconnectBaseDelay: defaultReconnectBaseDelay,
@@ -160,14 +164,32 @@ func (bb *blueBubbles) context() context.Context {
 	return context.Background()
 }
 
-func (bb *blueBubbles) getHTTPClient(media bool) *http.Client {
-	if media && bb.mediaHTTPClient != nil {
-		return bb.mediaHTTPClient
+type httpClientKind int
+
+const (
+	clientDefault httpClientKind = iota
+	clientSend
+	clientMedia
+)
+
+func (bb *blueBubbles) getHTTPClient(kind httpClientKind) *http.Client {
+	switch kind {
+	case clientSend:
+		if bb.sendHTTPClient != nil {
+			return bb.sendHTTPClient
+		}
+		return &http.Client{Timeout: defaultSendHTTPTimeout}
+	case clientMedia:
+		if bb.mediaHTTPClient != nil {
+			return bb.mediaHTTPClient
+		}
+		return &http.Client{Timeout: defaultMediaHTTPTimeout}
+	default:
+		if bb.httpClient != nil {
+			return bb.httpClient
+		}
+		return &http.Client{Timeout: defaultHTTPTimeout}
 	}
-	if bb.httpClient != nil {
-		return bb.httpClient
-	}
-	return &http.Client{Timeout: defaultHTTPTimeout}
 }
 
 func (bb *blueBubbles) sendBridgeState(stateEvent, errCode, message string) {
@@ -310,7 +332,7 @@ func (bb *blueBubbles) connectToWebSocket() (*websocket.Conn, error) {
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-		return nil, err
+		return nil, bb.sanitizeError(err)
 	}
 
 	deadline := time.Now().Add(handshakeTimeout)
@@ -1597,7 +1619,7 @@ func (bb *blueBubbles) SendMessage(chatID, text string, replyTo string, replyToP
 
 	var res SendTextResponse
 
-	err := bb.apiPost("/api/v1/message/text", request, &res)
+	err := bb.apiSendPost("/api/v1/message/text", request, &res)
 	if err != nil {
 		bb.log.Error().Err(err).Any("response", res).Msg("Failure when sending message to BlueBubbles")
 		return nil, err
@@ -1625,7 +1647,7 @@ func (bb *blueBubbles) UnsendMessage(chatID, targetGUID string, targetPart int) 
 
 	var res UnsendMessageResponse
 
-	err := bb.apiPost("/api/v1/message/"+targetGUID+"/unsend", request, &res)
+	err := bb.apiSendPost("/api/v1/message/"+targetGUID+"/unsend", request, &res)
 	if err != nil {
 		bb.log.Error().Err(err).Any("response", res).Msg("Failure when unsending message in BlueBubbles")
 		return nil, err
@@ -1659,7 +1681,7 @@ func (bb *blueBubbles) EditMessage(chatID string, targetGUID string, newText str
 
 	var res EditMessageResponse
 
-	err := bb.apiPost("/api/v1/message/"+targetGUID+"/edit", request, &res)
+	err := bb.apiSendPost("/api/v1/message/"+targetGUID+"/edit", request, &res)
 	if err != nil {
 		bb.clearPendingEdit(targetGUID, newText)
 		bb.log.Error().Err(err).Any("response", res).Msg("Failure when editing message in BlueBubbles")
@@ -1787,7 +1809,7 @@ func (bb *blueBubbles) sendReaction(chatID, targetGUID string, targetPart int, r
 
 	var res SendReactionResponse
 
-	err := bb.apiPost("/api/v1/message/react", request, &res)
+	err := bb.apiSendPost("/api/v1/message/react", request, &res)
 	if err != nil {
 		return nil, err
 	}
@@ -1883,7 +1905,12 @@ func (bb *blueBubbles) ResolveIdentifier(address string) (string, error) {
 
 	err := bb.apiGet(fmt.Sprintf("/api/v1/handle/%s", handle), nil, &identifierResponse)
 	if err != nil {
-		bb.log.Error().Any("response", identifierResponse).Str("address", address).Str("handle", handle).Msg("Failure when Resolving Identifier")
+		var statusErr *HTTPStatusError
+		if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
+			bb.log.Debug().Str("address", address).Str("handle", handle).Msg("Handle not found in BlueBubbles (404); assuming 'iMessage' service")
+			return "iMessage;-;" + handle, nil
+		}
+		bb.log.Error().Err(err).Any("response", identifierResponse).Str("address", address).Str("handle", handle).Msg("Failure when Resolving Identifier")
 		return "", err
 	}
 
@@ -1950,7 +1977,7 @@ func (bb *blueBubbles) CreateGroupWithMessage(users []string, initialMessage str
 	}
 
 	var res CreateChatResponse
-	if err := bb.apiPost("/api/v1/chat/new", req, &res); err != nil {
+	if err := bb.apiSendPost("/api/v1/chat/new", req, &res); err != nil {
 		bb.log.Error().Err(err).Any("response", res).Msg("Failure when creating group chat in BlueBubbles")
 		return nil, err
 	}
@@ -2038,6 +2065,99 @@ func (bb *blueBubbles) apiURL(path string, queryParams map[string]string) (strin
 	return u.String(), nil
 }
 
+type HTTPStatusError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("BlueBubbles %s %s returned HTTP %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+type redactedError struct {
+	msg   string
+	cause error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.cause }
+
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func redactSecret(s, secret string) string {
+	if s == "" || secret == "" {
+		return s
+	}
+	s = strings.ReplaceAll(s, secret, "REDACTED")
+	if escaped := url.QueryEscape(secret); escaped != secret {
+		s = strings.ReplaceAll(s, escaped, "REDACTED")
+	}
+	return s
+}
+
+func redactURLString(rawURL, secret string) string {
+	u, err := url.Parse(rawURL)
+	if err == nil {
+		q := u.Query()
+		changed := false
+		for _, key := range []string{"password", "guid", "token"} {
+			if q.Has(key) {
+				q.Set(key, "REDACTED")
+				changed = true
+			}
+		}
+		if changed {
+			u.RawQuery = q.Encode()
+			rawURL = u.String()
+		}
+	}
+	return redactSecret(rawURL, secret)
+}
+
+func (bb *blueBubbles) sanitizeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var secret string
+	if bb.bridge != nil && bb.bridge.GetConnectorConfig() != nil {
+		secret = bb.bridge.GetConnectorConfig().BlueBubblesPassword
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		sanitizedInner := urlErr.Err
+		if sanitizedInner != nil {
+			innerMsg := redactSecret(sanitizedInner.Error(), secret)
+			if innerMsg != sanitizedInner.Error() {
+				sanitizedInner = &redactedError{msg: innerMsg, cause: sanitizedInner}
+			}
+		}
+		return &url.Error{
+			Op:  urlErr.Op,
+			URL: redactURLString(urlErr.URL, secret),
+			Err: sanitizedInner,
+		}
+	}
+
+	msg := err.Error()
+	redacted := redactSecret(msg, secret)
+	if redacted != msg {
+		return &redactedError{msg: redacted, cause: err}
+	}
+	return err
+}
+
 func checkHTTPStatus(method, path string, resp *http.Response, body []byte) error {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return nil
@@ -2046,25 +2166,32 @@ func checkHTTPStatus(method, path string, resp *http.Response, body []byte) erro
 	if len(snippet) > 256 {
 		snippet = snippet[:256] + "..."
 	}
-	return fmt.Errorf("BlueBubbles %s %s returned HTTP %d: %s", method, path, resp.StatusCode, snippet)
+	return &HTTPStatusError{
+		Method:     method,
+		Path:       path,
+		StatusCode: resp.StatusCode,
+		Body:       snippet,
+	}
 }
 
 func (bb *blueBubbles) apiGet(path string, queryParams map[string]string, target interface{}) (err error) {
 	reqURL, err := bb.apiURL(path, queryParams)
 	if err != nil {
-		return err
+		return bb.sanitizeError(err)
 	}
 
 	req, err := http.NewRequestWithContext(bb.context(), http.MethodGet, reqURL, nil)
 	if err != nil {
+		err = bb.sanitizeError(err)
 		bb.log.Error().Err(err).Str("path", path).Msg("Error creating GET request")
 		return err
 	}
 
 	bb.bbRequestLock.Lock()
-	response, err := bb.getHTTPClient(false).Do(req)
+	response, err := bb.getHTTPClient(clientDefault).Do(req)
 	bb.bbRequestLock.Unlock()
 	if err != nil {
+		err = bb.sanitizeError(err)
 		bb.log.Error().Err(err).Str("path", path).Msg("Error making GET request")
 		return err
 	}
@@ -2072,11 +2199,13 @@ func (bb *blueBubbles) apiGet(path string, queryParams map[string]string, target
 
 	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
+		err = bb.sanitizeError(err)
 		bb.log.Error().Err(err).Str("path", path).Msg("Error reading response body")
 		return err
 	}
 
 	if err := checkHTTPStatus(http.MethodGet, path, response, responseBody); err != nil {
+		err = bb.sanitizeError(err)
 		bb.log.Error().Err(err).Int("status", response.StatusCode).Str("path", path).Msg("BlueBubbles GET request failed")
 		return err
 	}
@@ -2092,17 +2221,21 @@ func (bb *blueBubbles) apiGet(path string, queryParams map[string]string, target
 }
 
 func (bb *blueBubbles) apiPost(path string, payload interface{}, target interface{}) error {
-	return bb.apiRequest(http.MethodPost, path, payload, target)
+	return bb.apiRequestWithClient(http.MethodPost, path, payload, target, clientDefault, false)
+}
+
+func (bb *blueBubbles) apiSendPost(path string, payload interface{}, target interface{}) error {
+	return bb.apiRequestWithClient(http.MethodPost, path, payload, target, clientSend, true)
 }
 
 func (bb *blueBubbles) apiDelete(path string, payload interface{}, target interface{}) error {
-	return bb.apiRequest(http.MethodDelete, path, payload, target)
+	return bb.apiRequestWithClient(http.MethodDelete, path, payload, target, clientDefault, false)
 }
 
-func (bb *blueBubbles) apiRequest(method, path string, payload interface{}, target interface{}) (err error) {
+func (bb *blueBubbles) apiRequestWithClient(method, path string, payload interface{}, target interface{}, clientKind httpClientKind, isSend bool) (err error) {
 	reqURL, err := bb.apiURL(path, nil)
 	if err != nil {
-		return err
+		return bb.sanitizeError(err)
 	}
 
 	var bodyReader io.Reader
@@ -2117,6 +2250,7 @@ func (bb *blueBubbles) apiRequest(method, path string, payload interface{}, targ
 
 	req, err := http.NewRequestWithContext(bb.context(), method, reqURL, bodyReader)
 	if err != nil {
+		err = bb.sanitizeError(err)
 		bb.log.Error().Err(err).Str("method", method).Str("path", path).Msg("Error creating request")
 		return err
 	}
@@ -2124,9 +2258,13 @@ func (bb *blueBubbles) apiRequest(method, path string, payload interface{}, targ
 	req.Header.Set("Content-Type", "application/json")
 
 	bb.bbRequestLock.Lock()
-	response, err := bb.getHTTPClient(false).Do(req)
+	response, err := bb.getHTTPClient(clientKind).Do(req)
 	bb.bbRequestLock.Unlock()
 	if err != nil {
+		err = bb.sanitizeError(err)
+		if isSend && isTimeoutError(err) {
+			err = fmt.Errorf("%w: %w", imessage.ErrSendTimeout, err)
+		}
 		bb.log.Error().Err(err).Str("method", method).Str("path", path).Msg("Error making request")
 		return err
 	}
@@ -2134,11 +2272,16 @@ func (bb *blueBubbles) apiRequest(method, path string, payload interface{}, targ
 
 	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
+		err = bb.sanitizeError(err)
+		if isSend && isTimeoutError(err) {
+			err = fmt.Errorf("%w: %w", imessage.ErrSendTimeout, err)
+		}
 		bb.log.Error().Err(err).Str("path", path).Msg("Error reading response body")
 		return err
 	}
 
 	if err := checkHTTPStatus(method, path, response, responseBody); err != nil {
+		err = bb.sanitizeError(err)
 		bb.log.Error().Err(err).Int("status", response.StatusCode).Str("method", method).Str("path", path).Msg("BlueBubbles request failed")
 		return err
 	}
@@ -2156,7 +2299,7 @@ func (bb *blueBubbles) apiRequest(method, path string, payload interface{}, targ
 func (bb *blueBubbles) apiPostAsFormData(path string, formData map[string]interface{}, target interface{}) error {
 	reqURL, err := bb.apiURL(path, nil)
 	if err != nil {
-		return err
+		return bb.sanitizeError(err)
 	}
 
 	// Create a new buffer to store the file content
@@ -2209,6 +2352,7 @@ func (bb *blueBubbles) apiPostAsFormData(path string, formData map[string]interf
 
 	req, err := http.NewRequestWithContext(bb.context(), http.MethodPost, reqURL, &body)
 	if err != nil {
+		err = bb.sanitizeError(err)
 		bb.log.Error().Err(err).Str("path", path).Msg("Error creating multipart POST request")
 		return err
 	}
@@ -2216,9 +2360,13 @@ func (bb *blueBubbles) apiPostAsFormData(path string, formData map[string]interf
 
 	// Make the HTTP POST request
 	bb.bbRequestLock.Lock()
-	response, err := bb.getHTTPClient(true).Do(req)
+	response, err := bb.getHTTPClient(clientMedia).Do(req)
 	bb.bbRequestLock.Unlock()
 	if err != nil {
+		err = bb.sanitizeError(err)
+		if isTimeoutError(err) {
+			err = fmt.Errorf("%w: %w", imessage.ErrSendTimeout, err)
+		}
 		bb.log.Error().Err(err).Str("path", path).Msg("Error making POST request")
 		return err
 	}
@@ -2226,11 +2374,16 @@ func (bb *blueBubbles) apiPostAsFormData(path string, formData map[string]interf
 
 	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
+		err = bb.sanitizeError(err)
+		if isTimeoutError(err) {
+			err = fmt.Errorf("%w: %w", imessage.ErrSendTimeout, err)
+		}
 		bb.log.Error().Err(err).Str("path", path).Msg("Error reading response body")
 		return err
 	}
 
 	if err := checkHTTPStatus(http.MethodPost, path, response, responseBody); err != nil {
+		err = bb.sanitizeError(err)
 		bb.log.Error().Err(err).Int("status", response.StatusCode).Str("path", path).Msg("BlueBubbles multipart POST failed")
 		return err
 	}
@@ -2373,17 +2526,25 @@ func (bb *blueBubbles) convertBBMessageToiMessage(bbMessage Message) (*imessage.
 		}
 	}
 
-	// Attachments
+	// Attachments: preserve exact source part indices even when a download fails
+	// so surviving parts do not shift and attachment-only messages are not mistaken
+	// for retractions.
 	if len(bbMessage.Attachments) > 0 {
-		message.Attachments = make([]*imessage.Attachment, 0, len(bbMessage.Attachments))
-		for _, bbAttachment := range bbMessage.Attachments {
+		message.Attachments = make([]*imessage.Attachment, len(bbMessage.Attachments))
+		for i, bbAttachment := range bbMessage.Attachments {
 			downloaded, err := bb.downloadAttachment(bbAttachment.GUID)
 			if err != nil {
 				bb.log.Err(err).Str("attachmentGUID", bbAttachment.GUID).Msg("Failed to download attachment")
+				message.Attachments[i] = &imessage.Attachment{
+					GUID:          bbAttachment.GUID,
+					FileName:      bbAttachment.TransferName,
+					MimeType:      bbAttachment.MimeType,
+					DownloadError: err.Error(),
+				}
 				continue
 			}
 
-			message.Attachments = append(message.Attachments, downloaded)
+			message.Attachments[i] = downloaded
 		}
 	}
 
@@ -2483,11 +2644,12 @@ func (bb *blueBubbles) downloadAttachment(guid string) (attachment *imessage.Att
 
 	req, err := http.NewRequestWithContext(bb.context(), http.MethodGet, reqURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, bb.sanitizeError(err)
 	}
 
-	response, err := bb.getHTTPClient(true).Do(req)
+	response, err := bb.getHTTPClient(clientMedia).Do(req)
 	if err != nil {
+		err = bb.sanitizeError(err)
 		bb.log.Error().Err(err).Str("guid", guid).Msg("Error downloading attachment from BlueBubbles")
 		return nil, err
 	}
@@ -2495,7 +2657,7 @@ func (bb *blueBubbles) downloadAttachment(guid string) (attachment *imessage.Att
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		bodySnippet, _ := io.ReadAll(io.LimitReader(response.Body, 256))
-		err = checkHTTPStatus(http.MethodGet, downloadPath, response, bodySnippet)
+		err = bb.sanitizeError(checkHTTPStatus(http.MethodGet, downloadPath, response, bodySnippet))
 		bb.log.Error().Err(err).Str("guid", guid).Msg("BlueBubbles attachment download failed")
 		return nil, err
 	}
