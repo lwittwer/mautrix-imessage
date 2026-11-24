@@ -907,3 +907,76 @@ func TestEditMessageSuppressesOwnEcho(t *testing.T) {
 		t.Fatal("expected newer edit from another device to reach messageChan")
 	}
 }
+
+func TestEditMessageSuppressesEchoWithoutDateEditedAndBeforeHTTPResponse(t *testing.T) {
+	var bb *blueBubbles
+	var triggerEarlyEcho atomic.Bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/message/msg-early/edit":
+			if triggerEarlyEcho.Load() {
+				// Simulate WebSocket updated-message arriving BEFORE the HTTP response returns.
+				earlyEcho := json.RawMessage(`{"guid":"msg-early","isFromMe":true,"text":"early edit","dateCreated":1700000000000,"dateEdited":1700000030000,"chats":[{"guid":"iMessage;-;+15551234567"}]}`)
+				if err := bb.handleMessageUpdated(earlyEcho); err != nil {
+					t.Errorf("early handleMessageUpdated failed: %v", err)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(EditMessageResponse{
+				Status: 200,
+				Data: Message{
+					GUID:        "msg-early",
+					DateCreated: 1700000000000,
+					DateEdited:  1700000030000,
+					IsFromMe:    true,
+					Text:        "early edit",
+					Chats:       []Chat{{GUID: "iMessage;-;+15551234567"}},
+				},
+			})
+		case "/api/v1/message/msg-no-ts/edit":
+			// Simulate older server omitting dateEdited in HTTP response.
+			_ = json.NewEncoder(w).Encode(EditMessageResponse{
+				Status: 200,
+				Data: Message{
+					GUID:        "msg-no-ts",
+					DateCreated: 1700000000000,
+					DateEdited:  0,
+					IsFromMe:    true,
+					Text:        "old text",
+					Chats:       []Chat{{GUID: "iMessage;-;+15551234567"}},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	bb, _ = newTestConnector(t, srv.URL)
+	bb.usingPrivateAPI.Store(true)
+	triggerEarlyEcho.Store(true)
+
+	// Case 1: Echo arrives before HTTP response completes.
+	if _, err := bb.EditMessage("iMessage;-;+15551234567", "msg-early", "early edit", 0); err != nil {
+		t.Fatalf("EditMessage early failed: %v", err)
+	}
+	select {
+	case msg := <-bb.messageChan:
+		t.Fatalf("expected early websocket echo before HTTP response to be suppressed, got %+v", msg)
+	default:
+	}
+
+	// Case 2: HTTP response omits dateEdited, echo arrives after with non-zero dateEdited.
+	if _, err := bb.EditMessage("iMessage;-;+15551234567", "msg-no-ts", "no ts edit", 0); err != nil {
+		t.Fatalf("EditMessage no-ts failed: %v", err)
+	}
+	noTsEcho := json.RawMessage(`{"guid":"msg-no-ts","isFromMe":true,"text":"no ts edit","dateCreated":1700000000000,"dateEdited":1700000040000,"chats":[{"guid":"iMessage;-;+15551234567"}]}`)
+	if err := bb.handleMessageUpdated(noTsEcho); err != nil {
+		t.Fatalf("handleMessageUpdated no-ts echo failed: %v", err)
+	}
+	select {
+	case msg := <-bb.messageChan:
+		t.Fatalf("expected echo after response omitting dateEdited to be suppressed, got %+v", msg)
+	default:
+	}
+}

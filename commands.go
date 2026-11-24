@@ -283,7 +283,7 @@ func fnCreateGroup(ce *WrappedCommandEvent) {
 			return
 		}
 		roomID = portal.MXID
-		ce.Reply("Created group portal room [%s](%s) and invited you to it.%s", roomID, roomID.URI(ce.Bridge.Config.Homeserver.Domain).MatrixToURL(), initialMsgWarning)
+		ce.Reply("Group portal room [%s](%s) is ready.%s", roomID, roomID.URI(ce.Bridge.Config.Homeserver.Domain).MatrixToURL(), initialMsgWarning)
 	} else {
 		ce.Reply("Group portal room [%s](%s) already exists.%s", roomID, roomID.URI(ce.Bridge.Config.Homeserver.Domain).MatrixToURL(), initialMsgWarning)
 	}
@@ -303,7 +303,16 @@ var cmdSync = &commands.FullHandler{
 func fnSync(ce *WrappedCommandEvent) {
 	ce.Bridge.ZLog.Trace().Str("cmd", ce.Command).Msg("fnSync")
 
+	if !ce.Bridge.syncInProgress.CompareAndSwap(false, true) {
+		ce.Reply("A sync is already in progress.")
+		return
+	}
+
+	ce.Reply("Syncing contacts and portals…")
+
 	go func() {
+		defer ce.Bridge.syncInProgress.Store(false)
+
 		var contactStatus string
 		if err := ce.Bridge.IM.RefreshContactList(); err != nil {
 			if errors.Is(err, errors.ErrUnsupported) {

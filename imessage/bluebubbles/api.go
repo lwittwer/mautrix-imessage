@@ -53,8 +53,14 @@ const (
 	defaultReconnectBaseDelay     = 1 * time.Second
 	defaultReconnectMaxDelay      = 60 * time.Second
 	defaultContactRefreshInterval = 1 * time.Hour
+	defaultPendingEditTTL         = 60 * time.Second
 	maxTrackedEditedMessages      = 10000
 )
+
+type pendingEdit struct {
+	text      string
+	expiresAt time.Time
+}
 
 var (
 	_ imessage.API                         = (*blueBubbles)(nil)
@@ -84,8 +90,9 @@ type blueBubbles struct {
 	contacts               []Contact
 	contactRefreshInterval time.Duration
 
-	editedLock sync.Mutex
-	lastEdited map[string]int64
+	editedLock   sync.Mutex
+	lastEdited   map[string]int64
+	pendingEdits map[string]pendingEdit
 
 	httpClient      *http.Client
 	mediaHTTPClient *http.Client
@@ -124,6 +131,7 @@ func NewBlueBubblesConnector(bridge imessage.Bridge) (imessage.API, error) {
 
 		contactRefreshInterval: defaultContactRefreshInterval,
 		lastEdited:             make(map[string]int64),
+		pendingEdits:           make(map[string]pendingEdit),
 
 		httpClient:      &http.Client{Timeout: defaultHTTPTimeout},
 		mediaHTTPClient: &http.Client{Timeout: defaultMediaHTTPTimeout},
@@ -609,6 +617,60 @@ func (bb *blueBubbles) markEdited(guid string, dateEdited int64) {
 	bb.lastEdited[guid] = dateEdited
 }
 
+func (bb *blueBubbles) setPendingEdit(guid, newText string) {
+	if guid == "" {
+		return
+	}
+	now := time.Now()
+	bb.editedLock.Lock()
+	defer bb.editedLock.Unlock()
+	if bb.pendingEdits == nil {
+		bb.pendingEdits = make(map[string]pendingEdit)
+	}
+	for k, v := range bb.pendingEdits {
+		if now.After(v.expiresAt) {
+			delete(bb.pendingEdits, k)
+		}
+	}
+	bb.pendingEdits[guid] = pendingEdit{
+		text:      newText,
+		expiresAt: now.Add(defaultPendingEditTTL),
+	}
+}
+
+func (bb *blueBubbles) clearPendingEdit(guid, text string) {
+	if guid == "" {
+		return
+	}
+	bb.editedLock.Lock()
+	defer bb.editedLock.Unlock()
+	if p, ok := bb.pendingEdits[guid]; ok && p.text == text {
+		delete(bb.pendingEdits, guid)
+	}
+}
+
+func (bb *blueBubbles) consumePendingEdit(guid, text string) bool {
+	if guid == "" {
+		return false
+	}
+	now := time.Now()
+	bb.editedLock.Lock()
+	defer bb.editedLock.Unlock()
+	p, ok := bb.pendingEdits[guid]
+	if !ok {
+		return false
+	}
+	if now.After(p.expiresAt) {
+		delete(bb.pendingEdits, guid)
+		return false
+	}
+	if p.text != text {
+		return false
+	}
+	delete(bb.pendingEdits, guid)
+	return true
+}
+
 func (bb *blueBubbles) handleNewMessage(rawMessage json.RawMessage) (err error) {
 	bb.log.Trace().RawJSON("rawMessage", rawMessage).Msg("handleNewMessage")
 
@@ -720,7 +782,15 @@ func (bb *blueBubbles) handleMessageUpdated(rawMessage json.RawMessage) (err err
 		return err
 	}
 
-	isNewEdit := message.IsEdited && bb.isNewEdit(data.GUID, data.DateEdited)
+	isNewEdit := false
+	if message.IsEdited {
+		if bb.consumePendingEdit(data.GUID, data.Text) {
+			// Echo of our own Matrix-initiated edit (arrived before HTTP response or without dateEdited in response).
+			bb.markEdited(data.GUID, data.DateEdited)
+		} else {
+			isNewEdit = bb.isNewEdit(data.GUID, data.DateEdited)
+		}
+	}
 	if isNewEdit || message.IsRetracted {
 		select {
 		case bb.messageChan <- message:
@@ -1583,24 +1653,33 @@ func (bb *blueBubbles) EditMessage(chatID string, targetGUID string, newText str
 		PartIndex:                     targetPart,
 	}
 
+	// Record a pending own edit before the POST so an updated-message echo that arrives
+	// before the HTTP response (or when the response omits dateEdited) is still suppressed.
+	bb.setPendingEdit(targetGUID, newText)
+
 	var res EditMessageResponse
 
 	err := bb.apiPost("/api/v1/message/"+targetGUID+"/edit", request, &res)
 	if err != nil {
+		bb.clearPendingEdit(targetGUID, newText)
 		bb.log.Error().Err(err).Any("response", res).Msg("Failure when editing message in BlueBubbles")
 		return nil, err
 	}
 
 	if res.Status != 200 {
+		bb.clearPendingEdit(targetGUID, newText)
 		bb.log.Error().Int64("statusCode", res.Status).Any("response", res).Msg("Failure when editing message in BlueBubbles")
 		return nil, fmt.Errorf("could not edit message (status %d: %s)", res.Status, res.Message)
 	}
 
-	// Mark this edit timestamp as already processed so BlueBubbles's updated-message echo
-	// does not bridge our own Matrix edit back as a duplicate m.replace event.
-	bb.markEdited(targetGUID, res.Data.DateEdited)
-	if res.Data.GUID != "" && res.Data.GUID != targetGUID {
-		bb.markEdited(res.Data.GUID, res.Data.DateEdited)
+	// Mark this edit timestamp as already processed (if returned) so BlueBubbles's
+	// updated-message echo does not bridge our own Matrix edit back as a duplicate m.replace.
+	if res.Data.DateEdited != 0 {
+		bb.markEdited(targetGUID, res.Data.DateEdited)
+		if res.Data.GUID != "" && res.Data.GUID != targetGUID {
+			bb.markEdited(res.Data.GUID, res.Data.DateEdited)
+		}
+		bb.clearPendingEdit(targetGUID, newText)
 	}
 
 	return buildSendResponse(chatID, res.Data), nil
