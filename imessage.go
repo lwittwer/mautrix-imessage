@@ -185,6 +185,11 @@ func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
 		),
 		msg.ThreadID,
 	)
+	if len(portal.MXID) == 0 && !portal.Identifier.IsGroup && portal.Identifier.Service == "any" {
+		if bound := imh.bridge.bindExistingDMPortal(msg.ChatGUID, msg.Service); bound != nil {
+			portal = bound
+		}
+	}
 	if msg.ThreadID != "" && msg.ThreadID != portal.ThreadID {
 		portal.log.Infoln("Found portal thread ID in message: %s (prev: %s)", msg.ThreadID, portal.ThreadID)
 		portal.ThreadID = msg.ThreadID
@@ -198,6 +203,8 @@ func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
 		err := portal.CreateMatrixRoom(nil, nil)
 		if err != nil {
 			imh.log.Warnfln("Failed to create Matrix room to handle message: %v", err)
+			msg.CleanupTempAttachments()
+			imh.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, "", false)
 			return
 		}
 	}
@@ -205,6 +212,8 @@ func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
 	case portal.Messages <- msg:
 	case <-time.After(PortalBufferTimeout):
 		imh.log.Errorln("Portal message buffer is still full after 10 seconds, dropping message %s", msg.GUID)
+		msg.CleanupTempAttachments()
+		imh.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, "", false)
 	}
 }
 

@@ -47,6 +47,7 @@ const (
 	IMessageAliasRemoved  string = "imessage-alias-removed"
 
 	defaultHTTPTimeout            = 30 * time.Second
+	defaultProbeHTTPTimeout       = 5 * time.Second
 	defaultSendHTTPTimeout        = 2 * time.Minute
 	defaultMediaHTTPTimeout       = 2 * time.Minute
 	defaultWSReadTimeout          = 90 * time.Second
@@ -56,6 +57,10 @@ const (
 	defaultReconnectMaxDelay      = 60 * time.Second
 	defaultContactRefreshInterval = 1 * time.Hour
 	defaultPendingEditTTL         = 60 * time.Second
+	defaultPendingGroupActionTTL  = 60 * time.Second
+	defaultCatchUpExtraMargin     = 30 * time.Second
+	defaultEditRetractLookback    = 20 * time.Minute
+	kvEditedPrefix                = "bb_edit:"
 	maxTrackedEditedMessages      = 10000
 )
 
@@ -64,11 +69,18 @@ type pendingEdit struct {
 	expiresAt time.Time
 }
 
+type pendingGroupName struct {
+	name      string
+	expiresAt time.Time
+}
+
 var (
 	_ imessage.API                         = (*blueBubbles)(nil)
 	_ imessage.VenturaFeatures             = (*blueBubbles)(nil)
 	_ imessage.CustomEmojiTapbackAPI       = (*blueBubbles)(nil)
 	_ imessage.GroupCreationWithMessageAPI = (*blueBubbles)(nil)
+	_ imessage.GroupAdminAPI               = (*blueBubbles)(nil)
+	_ imessage.HealthAPI                   = (*blueBubbles)(nil)
 )
 
 type blueBubbles struct {
@@ -92,14 +104,22 @@ type blueBubbles struct {
 	contacts               []Contact
 	contactRefreshInterval time.Duration
 
-	editedLock   sync.Mutex
-	lastEdited   map[string]int64
-	pendingEdits map[string]pendingEdit
+	editedLock          sync.Mutex
+	lastEdited          map[string]int64
+	inflightEdits       map[string][]int64
+	inflightRetractions map[string]struct{}
+	pendingEdits        map[string]pendingEdit
+	pendingGroupNames   map[string]pendingGroupName
 
 	httpClient      *http.Client
+	probeHTTPClient *http.Client
 	sendHTTPClient  *http.Client
 	mediaHTTPClient *http.Client
 	bbRequestLock   sync.Mutex
+
+	serviceCacheLock       sync.RWMutex
+	resolvedHandleServices map[string]string
+	chatServices           map[string]string
 
 	reconnectBaseDelay time.Duration
 	reconnectMaxDelay  time.Duration
@@ -107,6 +127,24 @@ type blueBubbles struct {
 	ctxMu  sync.RWMutex
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	wsConnected    atomic.Bool
+	connectedSince atomic.Int64
+	disconnectedAt atomic.Int64
+	lastEventAt    atomic.Int64
+	reconnectCount atomic.Int64
+
+	healthMu          sync.RWMutex
+	serverInfo        ServerInfo
+	hasServerInfo     bool
+	lastDisconnectErr string
+	lastCatchUpAt     time.Time
+	lastCatchUpChats  int
+	lastCatchUpMsgs   int
+	lastCatchUpErr    string
+
+	catchUpMu      sync.Mutex
+	catchUpOverlap time.Duration
 
 	usingPrivateAPI atomic.Bool
 	// Outbound custom emoji tapbacks are intentionally gated off by default as
@@ -134,11 +172,18 @@ func NewBlueBubblesConnector(bridge imessage.Bridge) (imessage.API, error) {
 
 		contactRefreshInterval: defaultContactRefreshInterval,
 		lastEdited:             make(map[string]int64),
+		inflightEdits:          make(map[string][]int64),
+		inflightRetractions:    make(map[string]struct{}),
 		pendingEdits:           make(map[string]pendingEdit),
+		pendingGroupNames:      make(map[string]pendingGroupName),
 
 		httpClient:      &http.Client{Timeout: defaultHTTPTimeout},
+		probeHTTPClient: &http.Client{Timeout: defaultProbeHTTPTimeout},
 		sendHTTPClient:  &http.Client{Timeout: defaultSendHTTPTimeout},
 		mediaHTTPClient: &http.Client{Timeout: defaultMediaHTTPTimeout},
+
+		resolvedHandleServices: make(map[string]string),
+		chatServices:           make(map[string]string),
 
 		reconnectBaseDelay: defaultReconnectBaseDelay,
 		reconnectMaxDelay:  defaultReconnectMaxDelay,
@@ -168,12 +213,18 @@ type httpClientKind int
 
 const (
 	clientDefault httpClientKind = iota
+	clientProbe
 	clientSend
 	clientMedia
 )
 
 func (bb *blueBubbles) getHTTPClient(kind httpClientKind) *http.Client {
 	switch kind {
+	case clientProbe:
+		if bb.probeHTTPClient != nil {
+			return bb.probeHTTPClient
+		}
+		return &http.Client{Timeout: defaultProbeHTTPTimeout}
 	case clientSend:
 		if bb.sendHTTPClient != nil {
 			return bb.sendHTTPClient
@@ -205,12 +256,71 @@ func (bb *blueBubbles) sendBridgeState(stateEvent, errCode, message string) {
 }
 
 func (bb *blueBubbles) refreshPrivateAPI() {
-	enabled, err := bb.fetchPrivateAPI()
+	info, err := bb.fetchServerInfo()
 	if err != nil {
 		bb.log.Warn().Err(err).Bool("keepingPrivateAPI", bb.usingPrivateAPI.Load()).Msg("Failed to refresh BlueBubbles server info; keeping previous Private API state")
 		return
 	}
-	bb.usingPrivateAPI.Store(enabled)
+	bb.applyServerInfo(info)
+}
+
+func (bb *blueBubbles) applyServerInfo(info ServerInfo) {
+	bb.usingPrivateAPI.Store(info.PrivateAPI)
+	bb.healthMu.Lock()
+	bb.serverInfo = info
+	bb.hasServerInfo = true
+	bb.healthMu.Unlock()
+	if info.PrivateAPI && info.HelperConnected != nil && !*info.HelperConnected {
+		bb.log.Warn().
+			Str("serverVersion", info.ServerVersion).
+			Str("osVersion", info.OSVersion).
+			Msg("BlueBubbles reports Private API enabled, but helper_connected is false; Private API actions may fail until the helper reconnects to Messages.app")
+	}
+}
+
+func (bb *blueBubbles) GetHealth() *imessage.ConnectorHealth {
+	health := &imessage.ConnectorHealth{
+		WSConnected:    bb.wsConnected.Load(),
+		ReconnectCount: bb.reconnectCount.Load(),
+	}
+	if ts := bb.connectedSince.Load(); ts > 0 {
+		health.ConnectedSince = time.Unix(0, ts)
+	}
+	if ts := bb.disconnectedAt.Load(); ts > 0 {
+		health.DisconnectedSince = time.Unix(0, ts)
+	}
+	if ts := bb.lastEventAt.Load(); ts > 0 {
+		health.LastEventAt = time.Unix(0, ts)
+	}
+
+	info, err := bb.fetchServerInfo()
+	if err != nil {
+		health.ServerInfoErr = err.Error()
+	} else {
+		bb.applyServerInfo(info)
+	}
+
+	bb.healthMu.RLock()
+	if bb.hasServerInfo {
+		health.ServerVersion = bb.serverInfo.ServerVersion
+		health.OSVersion = bb.serverInfo.OSVersion
+		health.ProxyService = bb.serverInfo.ProxyService
+		health.PrivateAPI = bb.serverInfo.PrivateAPI
+		if bb.serverInfo.HelperConnected != nil {
+			v := *bb.serverInfo.HelperConnected
+			health.HelperConnected = &v
+		}
+	} else {
+		health.PrivateAPI = bb.usingPrivateAPI.Load()
+	}
+	health.LastDisconnectErr = bb.lastDisconnectErr
+	health.LastCatchUpAt = bb.lastCatchUpAt
+	health.LastCatchUpChats = bb.lastCatchUpChats
+	health.LastCatchUpMsgs = bb.lastCatchUpMsgs
+	health.LastCatchUpErr = bb.lastCatchUpErr
+	bb.healthMu.RUnlock()
+
+	return health
 }
 
 func (bb *blueBubbles) Start(readyCallback func()) error {
@@ -230,10 +340,21 @@ func (bb *blueBubbles) Start(readyCallback func()) error {
 
 	ws, err := bb.connectToWebSocket()
 	if err != nil {
+		bb.wsConnected.Store(false)
+		bb.disconnectedAt.Store(time.Now().UnixNano())
+		bb.healthMu.Lock()
+		bb.lastDisconnectErr = err.Error()
+		bb.healthMu.Unlock()
 		bb.sendBridgeState("TRANSIENT_DISCONNECT", "bb-connect-failed", err.Error())
 		return err
 	}
 	bb.setWS(ws)
+	bb.wsConnected.Store(true)
+	bb.connectedSince.Store(time.Now().UnixNano())
+	bb.disconnectedAt.Store(0)
+	bb.healthMu.Lock()
+	bb.lastDisconnectErr = ""
+	bb.healthMu.Unlock()
 	bb.sendBridgeState("CONNECTED", "", "")
 
 	go bb.wsLoop()
@@ -394,6 +515,11 @@ func (bb *blueBubbles) wsLoop() {
 			return
 		}
 		bb.log.Error().Err(err).Msg("Error polling messages from WebSocket")
+		bb.wsConnected.Store(false)
+		bb.disconnectedAt.CompareAndSwap(0, time.Now().UnixNano())
+		bb.healthMu.Lock()
+		bb.lastDisconnectErr = err.Error()
+		bb.healthMu.Unlock()
 		bb.stopListening()
 		bb.sendBridgeState("TRANSIENT_DISCONNECT", "bb-ws-disconnected", err.Error())
 
@@ -480,6 +606,7 @@ func (bb *blueBubbles) pollMessages() error {
 			bb.log.Warn().Str("event", websocketMessageType).Msg("Received BlueBubbles websocket event without payload")
 			return nil
 		}
+		bb.lastEventAt.Store(time.Now().UnixNano())
 
 		switch websocketMessageType {
 		case NewMessage:
@@ -587,14 +714,245 @@ func (bb *blueBubbles) reconnect() bool {
 		}
 
 		bb.setWS(ws)
+		now := time.Now()
+		prevDisconnect := bb.disconnectedAt.Swap(0)
+		bb.wsConnected.Store(true)
+		bb.connectedSince.Store(now.UnixNano())
+		bb.reconnectCount.Add(1)
+		bb.healthMu.Lock()
+		bb.lastDisconnectErr = ""
+		bb.healthMu.Unlock()
+
 		bb.refreshPrivateAPI()
 		bb.sendBridgeState("CONNECTED", "", "")
 		bb.log.Info().Int("attempt", attempt).Msg("Successfully reconnected to BlueBubbles WebSocket")
+
+		catchUpSince := bb.computeCatchUpSince(prevDisconnect, now)
+		go bb.runReconnectCatchUp(catchUpSince)
 		return true
 	}
 }
 
+func (bb *blueBubbles) computeCatchUpSince(disconnectedAtNano int64, now time.Time) time.Time {
+	overlap := bb.catchUpOverlap
+	if overlap <= 0 {
+		readTimeout := time.Duration(bb.wsReadTimeout.Load())
+		if readTimeout <= 0 {
+			readTimeout = defaultWSReadTimeout
+		}
+		overlap = readTimeout + defaultCatchUpExtraMargin
+	}
+	base := now
+	if disconnectedAtNano > 0 {
+		base = time.Unix(0, disconnectedAtNano)
+	}
+	return base.Add(-overlap)
+}
+
+func (bb *blueBubbles) getChatsWithActivityAfter(since, editLookback time.Time) ([]Chat, error) {
+	request := ChatQueryRequest{
+		Limit:  1000,
+		Offset: 0,
+		With: []ChatQueryWith{
+			ChatQueryWithLastMessage,
+			ChatQueryWithSMS,
+		},
+		Sort: QuerySortLastMessage,
+	}
+	chats, err := bb.queryChats(request, []Chat{})
+	if err != nil {
+		return nil, err
+	}
+	sinceMs := since.UnixMilli()
+	lookbackMs := editLookback.UnixMilli()
+	active := make([]Chat, 0)
+	for _, chat := range chats {
+		if chat.LastMessage == nil {
+			continue
+		}
+		lm := chat.LastMessage
+		if lm.DateCreated >= lookbackMs || lm.DateEdited >= sinceMs || lm.DateRetracted >= sinceMs {
+			active = append(active, chat)
+		}
+	}
+	return active, nil
+}
+
+func (bb *blueBubbles) runReconnectCatchUp(since time.Time) {
+	bb.catchUpMu.Lock()
+	defer bb.catchUpMu.Unlock()
+
+	if bb.context().Err() != nil {
+		return
+	}
+
+	editLookback := since.Add(-defaultEditRetractLookback)
+	bb.log.Info().Time("since", since).Time("editLookback", editLookback).Msg("Starting reconnect catch-up sync")
+	chats, err := bb.getChatsWithActivityAfter(since, editLookback)
+	if err != nil {
+		bb.log.Warn().Err(err).Time("since", since).Msg("Reconnect catch-up sync failed to query active chats")
+		bb.healthMu.Lock()
+		bb.lastCatchUpAt = time.Now()
+		bb.lastCatchUpChats = 0
+		bb.lastCatchUpMsgs = 0
+		bb.lastCatchUpErr = err.Error()
+		bb.healthMu.Unlock()
+		return
+	}
+
+	totalEnqueued := 0
+	var firstErr error
+	for _, chat := range chats {
+		if bb.context().Err() != nil {
+			return
+		}
+		enqueued, chatErr := bb.catchUpChat(chat, since, editLookback)
+		if chatErr != nil {
+			bb.log.Warn().Err(chatErr).Str("chatGUID", chat.GUID).Msg("Reconnect catch-up sync failed for chat")
+			if firstErr == nil {
+				firstErr = chatErr
+			}
+			continue
+		}
+		totalEnqueued += enqueued
+	}
+
+	bb.healthMu.Lock()
+	bb.lastCatchUpAt = time.Now()
+	bb.lastCatchUpChats = len(chats)
+	bb.lastCatchUpMsgs = totalEnqueued
+	if firstErr != nil {
+		bb.lastCatchUpErr = firstErr.Error()
+	} else {
+		bb.lastCatchUpErr = ""
+	}
+	bb.healthMu.Unlock()
+
+	bb.log.Info().Int("chats", len(chats)).Int("messages", totalEnqueued).Time("since", since).Msg("Finished reconnect catch-up sync")
+}
+
+func (bb *blueBubbles) catchUpChat(chat Chat, since, editLookback time.Time) (int, error) {
+	chatID := chat.GUID
+	sinceMs := since.UnixMilli()
+	after := editLookback.UnixMilli()
+	request := MessageQueryRequest{
+		ChatGUID: chatID,
+		Limit:    100,
+		Offset:   0,
+		With:     defaultMessageQueryWith(),
+		After:    &after,
+		Sort:     MessageQuerySortDesc,
+	}
+
+	rawMessages, err := bb.queryChatMessages(request, []Message{}, true)
+	if err != nil {
+		return 0, err
+	}
+
+	// Build chronological candidate list (oldest -> newest) so replies and tapbacks
+	// follow their target messages. Also include a pre-lookback LastMessage if it was
+	// edited or retracted during the disconnect window.
+	candidates := make([]Message, 0, len(rawMessages)+1)
+	seenCandidateGUIDs := make(map[string]struct{}, len(rawMessages)+1)
+	if chat.LastMessage != nil && chat.LastMessage.GUID != "" &&
+		(chat.LastMessage.DateRetracted >= sinceMs || chat.LastMessage.DateEdited >= sinceMs) {
+		inRaw := false
+		for _, r := range rawMessages {
+			if r.GUID == chat.LastMessage.GUID {
+				inRaw = true
+				break
+			}
+		}
+		if !inRaw {
+			lm := *chat.LastMessage
+			if full, fetchErr := bb.getMessageWithDetails(chat.LastMessage.GUID); fetchErr == nil && full != nil && full.GUID != "" {
+				lm = *full
+			}
+			if len(lm.Chats) == 0 {
+				lm.Chats = []Chat{{GUID: chatID, GroupID: chat.GroupID}}
+			}
+			candidates = append(candidates, lm)
+			seenCandidateGUIDs[lm.GUID] = struct{}{}
+		}
+	}
+	for i := len(rawMessages) - 1; i >= 0; i-- {
+		raw := rawMessages[i]
+		if _, dup := seenCandidateGUIDs[raw.GUID]; dup {
+			continue
+		}
+		seenCandidateGUIDs[raw.GUID] = struct{}{}
+		candidates = append(candidates, raw)
+	}
+	if len(candidates) == 0 {
+		return 0, nil
+	}
+
+	// Build a set of already-bridged message GUIDs so we skip downloading attachments
+	// for messages that already arrived before/during the overlap window.
+	seenGUIDs := make(map[string]struct{})
+	if bb.bridge != nil {
+		for _, guid := range bb.bridge.GetMessagesSince(chatID, editLookback.Add(-5*time.Minute)) {
+			seenGUIDs[guid] = struct{}{}
+		}
+	}
+
+	enqueued := 0
+	for _, raw := range candidates {
+		if bb.context().Err() != nil {
+			return enqueued, bb.context().Err()
+		}
+		if len(raw.Chats) == 0 {
+			raw.Chats = []Chat{{GUID: chatID, GroupID: chat.GroupID}}
+		}
+
+		_, alreadySeen := seenGUIDs[raw.GUID]
+		isRetracted := raw.DateRetracted != 0
+		isNewEdit := false
+		if raw.DateEdited != 0 {
+			if bb.consumePendingEdit(raw.GUID, raw.Text) {
+				bb.markEdited(raw.GUID, raw.DateEdited)
+			} else {
+				isNewEdit = bb.isNewEdit(raw.GUID, raw.DateEdited)
+			}
+		}
+
+		if raw.DateCreated < sinceMs {
+			// Pre-window message: only replay if it was retracted or newly edited during the disconnect window.
+			retractedInWindow := raw.DateRetracted >= sinceMs
+			editedInWindow := raw.DateEdited >= sinceMs && isNewEdit
+			if !retractedInWindow && !editedInWindow {
+				continue
+			}
+		} else if alreadySeen && !isRetracted && !isNewEdit {
+			continue
+		}
+
+		downloadAttachments := !isRetracted && (!alreadySeen || bb.shouldDownloadEditAttachments(len(raw.Attachments)))
+		converted, convErr := bb.convertBBMessageToiMessageWithOptions(raw, downloadAttachments)
+		if convErr != nil {
+			bb.log.Warn().Err(convErr).Str("guid", raw.GUID).Str("chatGUID", chatID).Msg("Failed to convert catch-up message")
+			continue
+		}
+
+		select {
+		case bb.messageChan <- converted:
+			enqueued++
+			if isRetracted {
+				bb.markRetractionInflight(raw.GUID)
+			} else if raw.DateEdited != 0 {
+				bb.markEditInflight(raw.GUID, raw.DateEdited)
+			}
+		case <-bb.context().Done():
+			converted.CleanupTempAttachments()
+			return enqueued, bb.context().Err()
+		}
+	}
+
+	return enqueued, nil
+}
+
 func (bb *blueBubbles) stopListening() {
+	bb.wsConnected.Store(false)
 	bb.wsMu.Lock()
 	ws := bb.ws
 	bb.ws = nil
@@ -609,16 +967,110 @@ func (bb *blueBubbles) stopListening() {
 	}
 }
 
+func (bb *blueBubbles) getPersistedEditTS(guid string) int64 {
+	kv, ok := bb.bridge.(imessage.KVStore)
+	if !ok || kv == nil {
+		return 0
+	}
+	raw := kv.GetKV(kvEditedPrefix + guid)
+	if raw == "" {
+		return 0
+	}
+	ts, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return ts
+}
+
+func (bb *blueBubbles) persistEditTS(guid string, dateEdited int64) {
+	kv, ok := bb.bridge.(imessage.KVStore)
+	if !ok || kv == nil {
+		return
+	}
+	kv.SetKV(kvEditedPrefix+guid, strconv.FormatInt(dateEdited, 10))
+}
+
+func (bb *blueBubbles) deletePersistedEditTS(guid string) {
+	kv, ok := bb.bridge.(imessage.KVStore)
+	if !ok || kv == nil {
+		return
+	}
+	kv.DeleteKV(kvEditedPrefix + guid)
+}
+
+func (bb *blueBubbles) shouldDownloadEditAttachments(attachmentCount int) bool {
+	if attachmentCount == 0 || attachmentCount > 1 {
+		return false
+	}
+	if cfg, ok := bb.bridge.(imessage.CaptionConfig); ok && cfg != nil && !cfg.IsCaptionInMessage() {
+		return false
+	}
+	return true
+}
+
 func (bb *blueBubbles) isNewEdit(guid string, dateEdited int64) bool {
 	if guid == "" || dateEdited == 0 {
 		return false
 	}
 	bb.editedLock.Lock()
-	defer bb.editedLock.Unlock()
-	if prev, ok := bb.lastEdited[guid]; ok && dateEdited <= prev {
-		return false
+	if queue := bb.inflightEdits[guid]; len(queue) > 0 {
+		maxInflight := queue[len(queue)-1]
+		for _, ts := range queue {
+			if ts > maxInflight {
+				maxInflight = ts
+			}
+		}
+		if dateEdited <= maxInflight {
+			bb.editedLock.Unlock()
+			return false
+		}
+	}
+	if prev, ok := bb.lastEdited[guid]; ok {
+		bb.editedLock.Unlock()
+		return dateEdited > prev
+	}
+	bb.editedLock.Unlock()
+
+	if persisted := bb.getPersistedEditTS(guid); persisted > 0 {
+		bb.editedLock.Lock()
+		if bb.lastEdited == nil {
+			bb.lastEdited = make(map[string]int64)
+		}
+		if prev, ok := bb.lastEdited[guid]; !ok || persisted > prev {
+			if len(bb.lastEdited) >= maxTrackedEditedMessages {
+				bb.lastEdited = make(map[string]int64)
+			}
+			bb.lastEdited[guid] = persisted
+		}
+		bb.editedLock.Unlock()
+		return dateEdited > persisted
 	}
 	return true
+}
+
+func (bb *blueBubbles) markEditInflight(guid string, dateEdited int64) {
+	if guid == "" || dateEdited == 0 {
+		return
+	}
+	bb.editedLock.Lock()
+	if bb.inflightEdits == nil {
+		bb.inflightEdits = make(map[string][]int64)
+	}
+	bb.inflightEdits[guid] = append(bb.inflightEdits[guid], dateEdited)
+	bb.editedLock.Unlock()
+}
+
+func (bb *blueBubbles) markRetractionInflight(guid string) {
+	if guid == "" {
+		return
+	}
+	bb.editedLock.Lock()
+	if bb.inflightRetractions == nil {
+		bb.inflightRetractions = make(map[string]struct{})
+	}
+	bb.inflightRetractions[guid] = struct{}{}
+	bb.editedLock.Unlock()
 }
 
 func (bb *blueBubbles) markEdited(guid string, dateEdited int64) {
@@ -626,17 +1078,20 @@ func (bb *blueBubbles) markEdited(guid string, dateEdited int64) {
 		return
 	}
 	bb.editedLock.Lock()
-	defer bb.editedLock.Unlock()
 	if bb.lastEdited == nil {
 		bb.lastEdited = make(map[string]int64)
 	}
 	if prev, ok := bb.lastEdited[guid]; ok && dateEdited <= prev {
+		bb.editedLock.Unlock()
 		return
 	}
 	if len(bb.lastEdited) >= maxTrackedEditedMessages {
 		bb.lastEdited = make(map[string]int64)
 	}
 	bb.lastEdited[guid] = dateEdited
+	bb.editedLock.Unlock()
+
+	bb.persistEditTS(guid, dateEdited)
 }
 
 func (bb *blueBubbles) setPendingEdit(guid, newText string) {
@@ -693,6 +1148,60 @@ func (bb *blueBubbles) consumePendingEdit(guid, text string) bool {
 	return true
 }
 
+func (bb *blueBubbles) setPendingGroupName(chatID, name string) {
+	if chatID == "" {
+		return
+	}
+	now := time.Now()
+	bb.editedLock.Lock()
+	defer bb.editedLock.Unlock()
+	if bb.pendingGroupNames == nil {
+		bb.pendingGroupNames = make(map[string]pendingGroupName)
+	}
+	for k, v := range bb.pendingGroupNames {
+		if now.After(v.expiresAt) {
+			delete(bb.pendingGroupNames, k)
+		}
+	}
+	bb.pendingGroupNames[chatID] = pendingGroupName{
+		name:      name,
+		expiresAt: now.Add(defaultPendingGroupActionTTL),
+	}
+}
+
+func (bb *blueBubbles) clearPendingGroupName(chatID, name string) {
+	if chatID == "" {
+		return
+	}
+	bb.editedLock.Lock()
+	defer bb.editedLock.Unlock()
+	if p, ok := bb.pendingGroupNames[chatID]; ok && p.name == name {
+		delete(bb.pendingGroupNames, chatID)
+	}
+}
+
+func (bb *blueBubbles) consumePendingGroupName(chatID, name string) bool {
+	if chatID == "" {
+		return false
+	}
+	now := time.Now()
+	bb.editedLock.Lock()
+	defer bb.editedLock.Unlock()
+	p, ok := bb.pendingGroupNames[chatID]
+	if !ok {
+		return false
+	}
+	if now.After(p.expiresAt) {
+		delete(bb.pendingGroupNames, chatID)
+		return false
+	}
+	if p.name != name {
+		return false
+	}
+	delete(bb.pendingGroupNames, chatID)
+	return true
+}
+
 func (bb *blueBubbles) handleNewMessage(rawMessage json.RawMessage) (err error) {
 	bb.log.Trace().RawJSON("rawMessage", rawMessage).Msg("handleNewMessage")
 
@@ -701,6 +1210,12 @@ func (bb *blueBubbles) handleNewMessage(rawMessage json.RawMessage) (err error) 
 	if err != nil {
 		bb.log.Warn().Err(err).RawJSON("rawMessage", rawMessage).Str("event", "handleNewMessage").Msg("Failed to parse event data")
 		return err
+	}
+
+	if imessage.ItemType(data.ItemType) == imessage.ItemTypeName && len(data.Chats) > 0 &&
+		bb.consumePendingGroupName(data.Chats[0].GUID, data.GroupTitle) {
+		bb.log.Debug().Str("chatGUID", data.Chats[0].GUID).Str("groupTitle", data.GroupTitle).Msg("Suppressing echo of Matrix-initiated group rename")
+		return nil
 	}
 
 	message, err := bb.convertBBMessageToiMessage(data)
@@ -712,10 +1227,13 @@ func (bb *blueBubbles) handleNewMessage(rawMessage json.RawMessage) (err error) 
 
 	select {
 	case bb.messageChan <- message:
-		if data.DateEdited != 0 {
-			bb.markEdited(data.GUID, data.DateEdited)
+		if data.DateRetracted != 0 {
+			bb.markRetractionInflight(data.GUID)
+		} else if data.DateEdited != 0 {
+			bb.markEditInflight(data.GUID, data.DateEdited)
 		}
 	default:
+		message.CleanupTempAttachments()
 		bb.log.Warn().Msg("Incoming message buffer is full")
 	}
 
@@ -808,9 +1326,10 @@ func (bb *blueBubbles) handleMessageUpdated(rawMessage json.RawMessage) (err err
 		}
 	}
 
-	// Only download attachments when forwarding a genuine new edit; delivery/read/retract
-	// updates and suppressed echoes do not need media fetched to disk.
-	downloadAttachments := isNewEdit && !isRetracted
+	// Only download attachments when forwarding a genuine new edit that may re-upload
+	// a single combined attachment+caption; delivery/read/retract updates, suppressed
+	// echoes, and caption-only edits do not need media fetched to disk.
+	downloadAttachments := isNewEdit && !isRetracted && bb.shouldDownloadEditAttachments(len(data.Attachments))
 	message, err := bb.convertBBMessageToiMessageWithOptions(data, downloadAttachments)
 	if err != nil {
 		bb.log.Warn().Err(err).RawJSON("rawMessage", rawMessage).Str("event", "handleMessageUpdated").Msg("Failed to convert message data")
@@ -820,39 +1339,41 @@ func (bb *blueBubbles) handleMessageUpdated(rawMessage json.RawMessage) (err err
 	if isNewEdit || message.IsRetracted {
 		select {
 		case bb.messageChan <- message:
-			if isNewEdit {
-				bb.markEdited(data.GUID, data.DateEdited)
+			if message.IsRetracted {
+				bb.markRetractionInflight(data.GUID)
+			} else if isNewEdit {
+				bb.markEditInflight(data.GUID, data.DateEdited)
 			}
 		default:
-			for _, att := range message.Attachments {
-				if att != nil && att.PathOnDisk != "" {
-					_ = os.Remove(att.PathOnDisk)
-				}
+			message.CleanupTempAttachments()
+			bb.log.Warn().Msg("Incoming message buffer is full")
+		}
+	}
+
+	if !message.IsRetracted {
+		if message.IsRead {
+			select {
+			case bb.receiptChan <- &imessage.ReadReceipt{
+				SenderGUID: message.ChatGUID,
+				IsFromMe:   !message.IsFromMe,
+				ChatGUID:   message.ChatGUID,
+				ReadUpTo:   message.GUID,
+				ReadAt:     message.ReadAt,
+			}:
+			default:
+				bb.log.Warn().Msg("Incoming message buffer is full")
 			}
-			bb.log.Warn().Msg("Incoming message buffer is full")
-		}
-	} else if message.IsRead {
-		select {
-		case bb.receiptChan <- &imessage.ReadReceipt{
-			SenderGUID: message.ChatGUID,
-			IsFromMe:   !message.IsFromMe,
-			ChatGUID:   message.ChatGUID,
-			ReadUpTo:   message.GUID,
-			ReadAt:     message.ReadAt,
-		}:
-		default:
-			bb.log.Warn().Msg("Incoming message buffer is full")
-		}
-	} else if message.IsDelivered {
-		select {
-		case bb.messageStatusChan <- &imessage.SendMessageStatus{
-			GUID:     message.GUID,
-			ChatGUID: message.ChatGUID,
-			Status:   "delivered",
-			Service:  imessage.ParseIdentifier(message.ChatGUID).Service,
-		}:
-		default:
-			bb.log.Warn().Msg("Incoming message buffer is full")
+		} else if message.IsDelivered {
+			select {
+			case bb.messageStatusChan <- &imessage.SendMessageStatus{
+				GUID:     message.GUID,
+				ChatGUID: message.ChatGUID,
+				Status:   "delivered",
+				Service:  imessage.ParseIdentifier(message.ChatGUID).Service,
+			}:
+			default:
+				bb.log.Warn().Msg("Incoming message buffer is full")
+			}
 		}
 	}
 
@@ -1023,7 +1544,7 @@ func (bb *blueBubbles) queryChatMessages(query MessageQueryRequest, allResults [
 	}
 
 	// If there are more messages to fetch and pagination is enabled
-	if paginate && (nextPageOffset < resp.Metadata.Total) {
+	if paginate && len(resp.Data) > 0 && resp.Metadata.Limit > 0 && (nextPageOffset < resp.Metadata.Total) {
 		// If the next page offset exceeds the maximum limit, adjust the query
 		if nextLimit > 0 && nextPageOffset+int64(nextLimit) > resp.Metadata.Total {
 			nextLimit = int(resp.Metadata.Total - nextPageOffset)
@@ -1071,6 +1592,34 @@ func (bb *blueBubbles) messageQueryRequestToMap(req *MessageQueryRequest) map[st
 	return m
 }
 
+func defaultMessageQueryWith() []MessageQueryWith {
+	return []MessageQueryWith{
+		MessageQueryWithChat,
+		MessageQueryWithChatParticipants,
+		MessageQueryWithAttachment,
+		MessageQueryWithHandle,
+		MessageQueryWithAttributeBody,
+		MessageQueryWithMessageSummary,
+		MessageQueryWithPayloadData,
+	}
+}
+
+func (bb *blueBubbles) convertChatQueryMessages(chatID string, messages []Message) []*imessage.Message {
+	resp := make([]*imessage.Message, 0, len(messages))
+	for _, msg := range messages {
+		if len(msg.Chats) == 0 {
+			msg.Chats = []Chat{{GUID: chatID}}
+		}
+		converted, err := bb.convertBBMessageToiMessage(msg)
+		if err != nil {
+			bb.log.Warn().Err(err).Str("guid", msg.GUID).Msg("Failed to convert message from BlueBubbles format to Matrix format")
+			continue
+		}
+		resp = append(resp, converted)
+	}
+	return reverseList(resp)
+}
+
 func (bb *blueBubbles) GetMessagesSinceDate(chatID string, minDate time.Time, backfillID string) (resp []*imessage.Message, err error) {
 	bb.log.Trace().Str("chatID", chatID).Time("minDate", minDate).Str("backfillID", backfillID).Msg("GetMessagesSinceDate")
 
@@ -1079,16 +1628,9 @@ func (bb *blueBubbles) GetMessagesSinceDate(chatID string, minDate time.Time, ba
 		ChatGUID: chatID,
 		Limit:    100,
 		Offset:   0,
-		With: []MessageQueryWith{
-			MessageQueryWith(MessageQueryWithChatParticipants),
-			MessageQueryWith(MessageQueryWithAttachment),
-			MessageQueryWith(MessageQueryWithHandle),
-			MessageQueryWith(MessageQueryWithAttributeBody),
-			MessageQueryWith(MessageQueryWithMessageSummary),
-			MessageQueryWith(MessageQueryWithPayloadData),
-		},
-		After: &after,
-		Sort:  MessageQuerySortDesc,
+		With:     defaultMessageQueryWith(),
+		After:    &after,
+		Sort:     MessageQuerySortDesc,
 	}
 
 	messages, err := bb.queryChatMessages(request, []Message{}, true)
@@ -1097,18 +1639,7 @@ func (bb *blueBubbles) GetMessagesSinceDate(chatID string, minDate time.Time, ba
 		return nil, err
 	}
 
-	for _, messsage := range messages {
-		imessage, err := bb.convertBBMessageToiMessage(messsage)
-		if err != nil {
-			bb.log.Warn().Err(err).Msg("Failed to convert message from BlueBubbles format to Matrix format")
-			continue
-		}
-		resp = append(resp, imessage)
-	}
-
-	resp = reverseList(resp)
-
-	return resp, nil
+	return bb.convertChatQueryMessages(chatID, messages), nil
 }
 
 func (bb *blueBubbles) GetMessagesBetween(chatID string, minDate, maxDate time.Time) (resp []*imessage.Message, err error) {
@@ -1120,17 +1651,10 @@ func (bb *blueBubbles) GetMessagesBetween(chatID string, minDate, maxDate time.T
 		ChatGUID: chatID,
 		Limit:    100,
 		Offset:   0,
-		With: []MessageQueryWith{
-			MessageQueryWith(MessageQueryWithChatParticipants),
-			MessageQueryWith(MessageQueryWithAttachment),
-			MessageQueryWith(MessageQueryWithHandle),
-			MessageQueryWith(MessageQueryWithAttributeBody),
-			MessageQueryWith(MessageQueryWithMessageSummary),
-			MessageQueryWith(MessageQueryWithPayloadData),
-		},
-		After:  &after,
-		Before: &before,
-		Sort:   MessageQuerySortDesc,
+		With:     defaultMessageQueryWith(),
+		After:    &after,
+		Before:   &before,
+		Sort:     MessageQuerySortDesc,
 	}
 
 	messages, err := bb.queryChatMessages(request, []Message{}, true)
@@ -1139,18 +1663,7 @@ func (bb *blueBubbles) GetMessagesBetween(chatID string, minDate, maxDate time.T
 		return nil, err
 	}
 
-	for _, messsage := range messages {
-		imessage, err := bb.convertBBMessageToiMessage(messsage)
-		if err != nil {
-			bb.log.Warn().Err(err).Msg("Failed to convert message from BlueBubbles format to Matrix format")
-			continue
-		}
-		resp = append(resp, imessage)
-	}
-
-	resp = reverseList(resp)
-
-	return resp, nil
+	return bb.convertChatQueryMessages(chatID, messages), nil
 }
 
 func (bb *blueBubbles) GetMessagesBeforeWithLimit(chatID string, before time.Time, limit int) (resp []*imessage.Message, err error) {
@@ -1168,16 +1681,9 @@ func (bb *blueBubbles) GetMessagesBeforeWithLimit(chatID string, before time.Tim
 		Limit:    queryLimit,
 		Max:      &limit,
 		Offset:   0,
-		With: []MessageQueryWith{
-			MessageQueryWith(MessageQueryWithChatParticipants),
-			MessageQueryWith(MessageQueryWithAttachment),
-			MessageQueryWith(MessageQueryWithHandle),
-			MessageQueryWith(MessageQueryWithAttributeBody),
-			MessageQueryWith(MessageQueryWithMessageSummary),
-			MessageQueryWith(MessageQueryWithPayloadData),
-		},
-		Before: &_before,
-		Sort:   MessageQuerySortDesc,
+		With:     defaultMessageQueryWith(),
+		Before:   &_before,
+		Sort:     MessageQuerySortDesc,
 	}
 
 	messages, err := bb.queryChatMessages(request, []Message{}, false)
@@ -1186,18 +1692,7 @@ func (bb *blueBubbles) GetMessagesBeforeWithLimit(chatID string, before time.Tim
 		return nil, err
 	}
 
-	for _, messsage := range messages {
-		imessage, err := bb.convertBBMessageToiMessage(messsage)
-		if err != nil {
-			bb.log.Warn().Err(err).Msg("Failed to convert message from BlueBubbles format to Matrix format")
-			continue
-		}
-		resp = append(resp, imessage)
-	}
-
-	resp = reverseList(resp)
-
-	return resp, nil
+	return bb.convertChatQueryMessages(chatID, messages), nil
 }
 
 func (bb *blueBubbles) GetMessagesWithLimit(chatID string, limit int, backfillID string) (resp []*imessage.Message, err error) {
@@ -1213,15 +1708,8 @@ func (bb *blueBubbles) GetMessagesWithLimit(chatID string, limit int, backfillID
 		Limit:    queryLimit,
 		Max:      &limit,
 		Offset:   0,
-		With: []MessageQueryWith{
-			MessageQueryWith(MessageQueryWithChatParticipants),
-			MessageQueryWith(MessageQueryWithAttachment),
-			MessageQueryWith(MessageQueryWithHandle),
-			MessageQueryWith(MessageQueryWithAttributeBody),
-			MessageQueryWith(MessageQueryWithMessageSummary),
-			MessageQueryWith(MessageQueryWithPayloadData),
-		},
-		Sort: MessageQuerySortDesc,
+		With:     defaultMessageQueryWith(),
+		Sort:     MessageQuerySortDesc,
 	}
 
 	messages, err := bb.queryChatMessages(request, []Message{}, false)
@@ -1230,18 +1718,7 @@ func (bb *blueBubbles) GetMessagesWithLimit(chatID string, limit int, backfillID
 		return nil, err
 	}
 
-	for _, messsage := range messages {
-		imessage, err := bb.convertBBMessageToiMessage(messsage)
-		if err != nil {
-			bb.log.Warn().Err(err).Msg("Failed to convert message from BlueBubbles format to Matrix format")
-			continue
-		}
-		resp = append(resp, imessage)
-	}
-
-	resp = reverseList(resp)
-
-	return resp, nil
+	return bb.convertChatQueryMessages(chatID, messages), nil
 }
 
 func (bb *blueBubbles) getMessage(guid string) (*Message, error) {
@@ -1251,6 +1728,20 @@ func (bb *blueBubbles) getMessage(guid string) (*Message, error) {
 
 	err := bb.apiGet(fmt.Sprintf("/api/v1/message/%s", guid), map[string]string{
 		"with": "chats",
+	}, &messageResponse)
+	if err != nil {
+		return nil, err
+	}
+
+	return &messageResponse.Data, nil
+}
+
+func (bb *blueBubbles) getMessageWithDetails(guid string) (*Message, error) {
+	bb.log.Trace().Str("guid", guid).Msg("getMessageWithDetails")
+
+	var messageResponse MessageResponse
+	err := bb.apiGet(fmt.Sprintf("/api/v1/message/%s", guid), map[string]string{
+		"with": "chats,attachment,handle,message.attributedBody,message.messageSummaryInfo,message.payloadData",
 	}, &messageResponse)
 	if err != nil {
 		return nil, err
@@ -1282,7 +1773,11 @@ func (bb *blueBubbles) GetMessage(guid string) (resp *imessage.Message, err erro
 }
 
 func (bb *blueBubbles) queryChats(query ChatQueryRequest, allResults []Chat) ([]Chat, error) {
-	bb.log.Info().Interface("query", query).Msg("queryChatMessages")
+	return bb.queryChatsWithStop(query, allResults, 0)
+}
+
+func (bb *blueBubbles) queryChatsWithStop(query ChatQueryRequest, allResults []Chat, stopBeforeCreatedMs int64) ([]Chat, error) {
+	bb.log.Debug().Interface("query", query).Msg("queryChats")
 
 	var resp ChatQueryResponse
 	err := bb.apiPost("/api/v1/chat/query", query, &resp)
@@ -1292,11 +1787,22 @@ func (bb *blueBubbles) queryChats(query ChatQueryRequest, allResults []Chat) ([]
 
 	allResults = append(allResults, resp.Data...)
 
+	if len(resp.Data) == 0 || resp.Metadata.Limit <= 0 {
+		return allResults, nil
+	}
+
+	if stopBeforeCreatedMs > 0 && query.Sort == QuerySortLastMessage {
+		lastChat := resp.Data[len(resp.Data)-1]
+		if lastChat.LastMessage == nil || lastChat.LastMessage.DateCreated < stopBeforeCreatedMs {
+			return allResults, nil
+		}
+	}
+
 	nextPageOffset := resp.Metadata.Offset + resp.Metadata.Limit
 	if nextPageOffset < resp.Metadata.Total {
 		query.Offset = nextPageOffset
 		query.Limit = resp.Metadata.Limit
-		return bb.queryChats(query, allResults)
+		return bb.queryChatsWithStop(query, allResults, stopBeforeCreatedMs)
 	}
 
 	return allResults, nil
@@ -1315,7 +1821,7 @@ func (bb *blueBubbles) GetChatsWithMessagesAfter(minDate time.Time) (resp []imes
 		Sort: QuerySortLastMessage,
 	}
 
-	chats, err := bb.queryChats(request, []Chat{})
+	chats, err := bb.queryChatsWithStop(request, []Chat{}, minDate.UnixMilli())
 	if err != nil {
 		bb.log.Error().Err(err).Time("minDate", minDate).Str("search", "GetChatsWithMessagesAfter").Msg("Failed to search for chats")
 		return nil, err
@@ -1716,13 +2222,42 @@ func (bb *blueBubbles) EditMessage(chatID string, targetGUID string, newText str
 	return buildSendResponse(chatID, res.Data), nil
 }
 
-func (bb *blueBubbles) fetchPrivateAPI() (bool, error) {
-	var serverInfo ServerInfoResponse
-	err := bb.apiGet("/api/v1/server/info", nil, &serverInfo)
+func (bb *blueBubbles) apiProbeGet(path string, queryParams map[string]string, target interface{}) error {
+	reqURL, err := bb.apiURL(path, queryParams)
 	if err != nil {
-		return false, err
+		return bb.sanitizeError(err)
 	}
-	return serverInfo.Data.PrivateAPI, nil
+	req, err := http.NewRequestWithContext(bb.context(), http.MethodGet, reqURL, nil)
+	if err != nil {
+		return bb.sanitizeError(err)
+	}
+	response, err := bb.getHTTPClient(clientProbe).Do(req)
+	if err != nil {
+		return bb.sanitizeError(err)
+	}
+	defer response.Body.Close()
+
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		return bb.sanitizeError(err)
+	}
+	if err := checkHTTPStatus(http.MethodGet, path, response, responseBody); err != nil {
+		return bb.sanitizeError(err)
+	}
+	if target != nil {
+		if err := json.Unmarshal(responseBody, target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (bb *blueBubbles) fetchServerInfo() (ServerInfo, error) {
+	var serverInfo ServerInfoResponse
+	if err := bb.apiProbeGet("/api/v1/server/info", nil, &serverInfo); err != nil {
+		return ServerInfo{}, err
+	}
+	return serverInfo.Data, nil
 }
 
 func (bb *blueBubbles) SendFile(chatID, text, filename string, pathOnDisk string, replyTo string, replyToPart int, mimeType string, voiceMemo bool, metadata imessage.MessageMetadata) (*imessage.SendResponse, error) {
@@ -1902,6 +2437,68 @@ func (bb *blueBubbles) SendTypingNotification(chatID string, typing bool) error 
 	return nil
 }
 
+func (bb *blueBubbles) setResolvedHandleService(address, service string) {
+	norm := normalizeParticipantAddress(address)
+	if norm == "" || service == "" || service == "any" {
+		return
+	}
+	bb.serviceCacheLock.Lock()
+	if bb.resolvedHandleServices == nil {
+		bb.resolvedHandleServices = make(map[string]string)
+	}
+	bb.resolvedHandleServices[norm] = service
+	bb.serviceCacheLock.Unlock()
+}
+
+func (bb *blueBubbles) getResolvedHandleService(address string) string {
+	norm := normalizeParticipantAddress(address)
+	if norm == "" {
+		return ""
+	}
+	bb.serviceCacheLock.RLock()
+	svc := bb.resolvedHandleServices[norm]
+	bb.serviceCacheLock.RUnlock()
+	return svc
+}
+
+func (bb *blueBubbles) setChatService(chatGUID, service string) {
+	if chatGUID == "" || service == "" || service == "any" {
+		return
+	}
+	bb.serviceCacheLock.Lock()
+	if bb.chatServices == nil {
+		bb.chatServices = make(map[string]string)
+	}
+	bb.chatServices[chatGUID] = service
+	bb.serviceCacheLock.Unlock()
+}
+
+func (bb *blueBubbles) getChatService(chatGUID string) string {
+	if chatGUID == "" {
+		return ""
+	}
+	bb.serviceCacheLock.RLock()
+	svc := bb.chatServices[chatGUID]
+	bb.serviceCacheLock.RUnlock()
+	return svc
+}
+
+func (bb *blueBubbles) lookupHandleService(address string) string {
+	norm := normalizeParticipantAddress(address)
+	if norm == "" {
+		return ""
+	}
+	var resp ResolveIdentifierResponse
+	if err := bb.apiProbeGet(fmt.Sprintf("/api/v1/handle/%s", norm), nil, &resp); err != nil {
+		return ""
+	}
+	if resp.Data.Service != "" && resp.Data.Service != "any" {
+		bb.setResolvedHandleService(norm, resp.Data.Service)
+		return resp.Data.Service
+	}
+	return ""
+}
+
 func (bb *blueBubbles) ResolveIdentifier(address string) (string, error) {
 	bb.log.Trace().Str("address", address).Msg("ResolveIdentifier")
 
@@ -1916,6 +2513,12 @@ func (bb *blueBubbles) ResolveIdentifier(address string) (string, error) {
 	if err != nil {
 		var statusErr *HTTPStatusError
 		if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
+			// BlueBubbles only records handles in chat.db after at least one message has been
+			// exchanged, so first-contact DMs return HTTP 404. Reuse any cached service first,
+			// otherwise default to iMessage so starting a brand-new DM is possible.
+			if cachedSvc := bb.getResolvedHandleService(handle); cachedSvc != "" {
+				return cachedSvc + ";-;" + handle, nil
+			}
 			bb.log.Debug().Str("address", address).Str("handle", handle).Msg("Handle not found in BlueBubbles (404); assuming 'iMessage' service")
 			return "iMessage;-;" + handle, nil
 		}
@@ -1928,7 +2531,31 @@ func (bb *blueBubbles) ResolveIdentifier(address string) (string, error) {
 		return "iMessage;-;" + handle, nil
 	}
 
+	bb.setResolvedHandleService(identifierResponse.Data.Address, identifierResponse.Data.Service)
+
+	// On macOS Sequoia+, chat.db stores many DM chats under the "any;-;" prefix
+	// regardless of whether the handle resolves to iMessage, SMS, or RCS.
+	// Reuse an existing "any;-;" chat when present to avoid splitting portals.
+	if anyGUID := bb.lookupExistingAnyChat(identifierResponse.Data.Address); anyGUID != "" {
+		return anyGUID, nil
+	}
+
 	return identifierResponse.Data.Service + ";-;" + identifierResponse.Data.Address, nil
+}
+
+func (bb *blueBubbles) lookupExistingAnyChat(address string) string {
+	if address == "" {
+		return ""
+	}
+	candidate := "any;-;" + address
+	var chatResp ChatResponse
+	if err := bb.apiProbeGet(fmt.Sprintf("/api/v1/chat/%s", candidate), nil, &chatResp); err != nil {
+		return ""
+	}
+	if chatResp.Data != nil && chatResp.Data.GUID != "" {
+		return chatResp.Data.GUID
+	}
+	return ""
 }
 
 func (bb *blueBubbles) PrepareDM(guid string) error {
@@ -1959,18 +2586,30 @@ func (bb *blueBubbles) CreateGroupWithMessage(users []string, initialMessage str
 	service := "iMessage"
 	addresses := make([]string, 0, len(users))
 	for _, user := range users {
+		var addr string
+		var explicitService string
 		if strings.Contains(user, ";") {
 			parsed := imessage.ParseIdentifier(user)
-			if parsed.Service == "SMS" {
+			explicitService = parsed.Service
+			addr = parsed.LocalID
+		} else {
+			addr = strings.TrimSpace(user)
+		}
+		if addr == "" {
+			continue
+		}
+		addresses = append(addresses, addr)
+
+		if explicitService == "SMS" {
+			service = "SMS"
+		} else if explicitService == "" || explicitService == "any" {
+			resolvedSvc := bb.getResolvedHandleService(addr)
+			if resolvedSvc == "" {
+				resolvedSvc = bb.lookupHandleService(addr)
+			}
+			if resolvedSvc == "SMS" {
 				service = "SMS"
 			}
-			if parsed.LocalID != "" {
-				addresses = append(addresses, parsed.LocalID)
-				continue
-			}
-		}
-		if trimmed := strings.TrimSpace(user); trimmed != "" {
-			addresses = append(addresses, trimmed)
 		}
 	}
 	if len(addresses) == 0 {
@@ -1999,6 +2638,148 @@ func (bb *blueBubbles) CreateGroupWithMessage(users []string, initialMessage str
 		GUID:     res.Data.GUID,
 		ThreadID: res.Data.GroupID,
 	}, nil
+}
+
+func (bb *blueBubbles) requireGroupAdmin(chatID string) error {
+	if !bb.usingPrivateAPI.Load() {
+		return errors.ErrUnsupported
+	}
+	parsed := imessage.ParseIdentifier(chatID)
+	if !parsed.IsGroup {
+		return errors.New("chat is not a group chat")
+	}
+	if parsed.Service == "SMS" || (parsed.Service == "any" && bb.getChatService(chatID) == "SMS") {
+		return errors.New("SMS/MMS group chats cannot be modified")
+	}
+	return nil
+}
+
+func normalizeParticipantAddress(address string) string {
+	trimmed := strings.TrimSpace(address)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.Contains(trimmed, ";") {
+		if parsed := imessage.ParseIdentifier(trimmed); parsed.LocalID != "" {
+			trimmed = parsed.LocalID
+		}
+	}
+	if !strings.Contains(trimmed, "@") {
+		if digits := numericOnly(trimmed); digits != "" {
+			return "+" + digits
+		}
+	}
+	return trimmed
+}
+
+func (bb *blueBubbles) SetGroupName(chatID, name string) error {
+	bb.log.Trace().Str("chatID", chatID).Str("name", name).Msg("SetGroupName")
+	if err := bb.requireGroupAdmin(chatID); err != nil {
+		return err
+	}
+
+	bb.setPendingGroupName(chatID, name)
+	var res GenericResponse
+	if err := bb.apiPut(fmt.Sprintf("/api/v1/chat/%s", chatID), UpdateChatRequest{DisplayName: name}, &res); err != nil {
+		bb.clearPendingGroupName(chatID, name)
+		return err
+	}
+	if res.Status != 0 && res.Status != 200 {
+		bb.clearPendingGroupName(chatID, name)
+		return fmt.Errorf("could not rename group chat (status %d: %s)", res.Status, res.Message)
+	}
+	return nil
+}
+
+func (bb *blueBubbles) AddGroupParticipant(chatID, address string) error {
+	bb.log.Trace().Str("chatID", chatID).Str("address", address).Msg("AddGroupParticipant")
+	if err := bb.requireGroupAdmin(chatID); err != nil {
+		return err
+	}
+	normalized := normalizeParticipantAddress(address)
+	if normalized == "" {
+		return errors.New("participant address is empty")
+	}
+	var res GenericResponse
+	if err := bb.apiPost(fmt.Sprintf("/api/v1/chat/%s/participant/add", chatID), ChatParticipantRequest{Address: normalized}, &res); err != nil {
+		return err
+	}
+	if res.Status != 0 && res.Status != 200 {
+		return fmt.Errorf("could not add participant %s (status %d: %s)", normalized, res.Status, res.Message)
+	}
+	return nil
+}
+
+func (bb *blueBubbles) RemoveGroupParticipant(chatID, address string) error {
+	bb.log.Trace().Str("chatID", chatID).Str("address", address).Msg("RemoveGroupParticipant")
+	if err := bb.requireGroupAdmin(chatID); err != nil {
+		return err
+	}
+	normalized := normalizeParticipantAddress(address)
+	if normalized == "" {
+		return errors.New("participant address is empty")
+	}
+	var res GenericResponse
+	if err := bb.apiPost(fmt.Sprintf("/api/v1/chat/%s/participant/remove", chatID), ChatParticipantRequest{Address: normalized}, &res); err != nil {
+		return err
+	}
+	if res.Status != 0 && res.Status != 200 {
+		return fmt.Errorf("could not remove participant %s (status %d: %s)", normalized, res.Status, res.Message)
+	}
+	return nil
+}
+
+func (bb *blueBubbles) SetGroupAvatar(chatID, filename string, data []byte) error {
+	bb.log.Trace().Str("chatID", chatID).Str("filename", filename).Int("size", len(data)).Msg("SetGroupAvatar")
+	if err := bb.requireGroupAdmin(chatID); err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		return errors.New("avatar data is empty")
+	}
+	if filename == "" {
+		filename = "avatar.jpg"
+	}
+	var res GenericResponse
+	if err := bb.apiPostAsFormData(fmt.Sprintf("/api/v1/chat/%s/icon", chatID), map[string]interface{}{
+		"icon": formFile{Filename: filename, Data: data},
+	}, &res); err != nil {
+		return err
+	}
+	if res.Status != 0 && res.Status != 200 {
+		return fmt.Errorf("could not set group avatar (status %d: %s)", res.Status, res.Message)
+	}
+	return nil
+}
+
+func (bb *blueBubbles) RemoveGroupAvatar(chatID string) error {
+	bb.log.Trace().Str("chatID", chatID).Msg("RemoveGroupAvatar")
+	if err := bb.requireGroupAdmin(chatID); err != nil {
+		return err
+	}
+	var res GenericResponse
+	if err := bb.apiDelete(fmt.Sprintf("/api/v1/chat/%s/icon", chatID), nil, &res); err != nil {
+		return err
+	}
+	if res.Status != 0 && res.Status != 200 {
+		return fmt.Errorf("could not remove group avatar (status %d: %s)", res.Status, res.Message)
+	}
+	return nil
+}
+
+func (bb *blueBubbles) LeaveGroup(chatID string) error {
+	bb.log.Trace().Str("chatID", chatID).Msg("LeaveGroup")
+	if err := bb.requireGroupAdmin(chatID); err != nil {
+		return err
+	}
+	var res GenericResponse
+	if err := bb.apiPost(fmt.Sprintf("/api/v1/chat/%s/leave", chatID), nil, &res); err != nil {
+		return err
+	}
+	if res.Status != 0 && res.Status != 200 {
+		return fmt.Errorf("could not leave group chat (status %d: %s)", res.Status, res.Message)
+	}
+	return nil
 }
 
 // Helper functions
@@ -2231,6 +3012,10 @@ func (bb *blueBubbles) apiGet(path string, queryParams map[string]string, target
 
 func (bb *blueBubbles) apiPost(path string, payload interface{}, target interface{}) error {
 	return bb.apiRequestWithClient(http.MethodPost, path, payload, target, clientDefault, false)
+}
+
+func (bb *blueBubbles) apiPut(path string, payload interface{}, target interface{}) error {
+	return bb.apiRequestWithClient(http.MethodPut, path, payload, target, clientDefault, false)
 }
 
 func (bb *blueBubbles) apiSendPost(path string, payload interface{}, target interface{}) error {
@@ -2493,6 +3278,9 @@ func (bb *blueBubbles) convertBBMessageToiMessageWithOptions(bbMessage Message, 
 	if message.Service == "" {
 		message.Service = imessage.ParseIdentifier(message.ChatGUID).Service
 	}
+	if message.Service != "" && message.Service != "any" {
+		bb.setChatService(message.ChatGUID, message.Service)
+	}
 	message.IsFromMe = bbMessage.IsFromMe
 	message.IsRead = bbMessage.DateRead != 0
 	if message.IsRead {
@@ -2636,12 +3424,24 @@ func (bb *blueBubbles) convertBBChatToiMessageChat(bbChat Chat) (*imessage.ChatI
 		members[i] = participant.Address
 	}
 
+	parsed := imessage.ParseIdentifier(bbChat.GUID)
+	service := parsed.Service
+	if bbChat.LastMessage != nil && bbChat.LastMessage.Handle.Service != "" && bbChat.LastMessage.Handle.Service != "any" {
+		service = bbChat.LastMessage.Handle.Service
+	} else if service == "any" {
+		service = ""
+	}
+	if service != "" {
+		bb.setChatService(bbChat.GUID, service)
+	}
+
 	chatInfo := &imessage.ChatInfo{
 		JSONChatGUID: bbChat.GUID,
-		Identifier:   imessage.ParseIdentifier(bbChat.GUID),
+		Identifier:   parsed,
 		DisplayName:  bbChat.DisplayName,
 		Members:      members,
 		ThreadID:     bbChat.GroupID,
+		Service:      service,
 	}
 
 	return chatInfo, nil
@@ -2708,6 +3508,7 @@ func (bb *blueBubbles) downloadAttachment(guid string) (attachment *imessage.Att
 		PathOnDisk: tempPath,
 		FileName:   attachmentResponse.Data.TransferName,
 		MimeType:   attachmentResponse.Data.MimeType,
+		IsTemp:     true,
 	}, nil
 }
 
@@ -2792,6 +3593,41 @@ func numericOnly(s string) string {
 // These functions are probably not necessary
 
 func (bb *blueBubbles) SendMessageBridgeResult(chatID, messageID string, eventID id.EventID, success bool) {
+	if messageID == "" {
+		return
+	}
+	bb.editedLock.Lock()
+	var editTS int64
+	var hasEdit bool
+	if queue := bb.inflightEdits[messageID]; len(queue) > 0 {
+		editTS = queue[0]
+		hasEdit = true
+		if len(queue) == 1 {
+			delete(bb.inflightEdits, messageID)
+		} else {
+			bb.inflightEdits[messageID] = queue[1:]
+		}
+	}
+	_, hasRetraction := bb.inflightRetractions[messageID]
+	if hasRetraction {
+		delete(bb.inflightRetractions, messageID)
+	}
+	if success && hasRetraction {
+		delete(bb.lastEdited, messageID)
+		delete(bb.inflightEdits, messageID)
+	}
+	bb.editedLock.Unlock()
+
+	if !success {
+		return
+	}
+	if hasRetraction {
+		bb.deletePersistedEditTS(messageID)
+		return
+	}
+	if hasEdit {
+		bb.markEdited(messageID, editTS)
+	}
 }
 func (bb *blueBubbles) SendBackfillResult(chatID, backfillID string, success bool, idMap map[string][]id.EventID) {
 }
@@ -2815,6 +3651,7 @@ func (bb *blueBubbles) Capabilities() imessage.ConnectorCapabilities {
 		SendCustomEmojiTapbacks:  privateAPI && bb.supportsCustomEmojiTapbacks.Load(),
 		UnsendMessages:           privateAPI,
 		EditMessages:             privateAPI,
+		GroupAdmin:               privateAPI,
 		SendReadReceipts:         privateAPI,
 		SendTypingNotifications:  privateAPI,
 		SendCaptions:             true,

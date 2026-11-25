@@ -17,6 +17,7 @@
 package imessage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,6 +87,21 @@ func (msg *Message) SenderText() string {
 		return "self"
 	}
 	return msg.Sender.LocalID
+}
+
+// CleanupTempAttachments removes any temporary on-disk attachment files created
+// by a connector (e.g. BlueBubbles downloads), ignoring already-deleted files.
+func (msg *Message) CleanupTempAttachments() {
+	if msg == nil {
+		return
+	}
+	for _, att := range msg.Attachments {
+		if att != nil && att.IsTemp && att.PathOnDisk != "" {
+			if err := att.Delete(); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.DefaultLogger.Warnfln("Failed to delete temp attachment %s in %s: %v", att.PathOnDisk, msg.GUID, err)
+			}
+		}
+	}
 }
 
 type ReadReceipt struct {
@@ -168,6 +184,7 @@ type Attachment struct {
 	FileName      string `json:"file_name"`
 	MimeType      string `json:"mime_type,omitempty"`
 	DownloadError string `json:"-"`
+	IsTemp        bool   `json:"-"`
 	triedMagic    bool
 }
 
@@ -222,6 +239,7 @@ type ChatInfo struct {
 	NoCreateRoom bool     `json:"no_create_room"`
 	ThreadID     string   `json:"thread_id,omitempty"`
 	Delete       bool     `json:"delete,omitempty"`
+	Service      string   `json:"service,omitempty"`
 }
 
 type Identifier struct {
@@ -236,11 +254,21 @@ func ParseIdentifier(guid string) Identifier {
 		return Identifier{}
 	}
 	parts := strings.Split(guid, ";")
+	if len(parts) < 3 {
+		return Identifier{LocalID: guid}
+	}
 	return Identifier{
 		Service: parts[0],
 		IsGroup: parts[1] == "+",
 		LocalID: parts[2],
 	}
+}
+
+func IsResolvedChatGUID(s string) bool {
+	return strings.HasPrefix(s, "iMessage;-;") ||
+		strings.HasPrefix(s, "SMS;-;") ||
+		strings.HasPrefix(s, "RCS;-;") ||
+		strings.HasPrefix(s, "any;-;")
 }
 
 func (id Identifier) String() string {
@@ -276,12 +304,32 @@ type ConnectorCapabilities struct {
 	SendCaptions             bool
 	UnsendMessages           bool
 	EditMessages             bool
+	GroupAdmin               bool
 	BridgeState              bool
 	MessageStatusCheckpoints bool
 	DeliveredStatus          bool
 	ContactChatMerging       bool
 	RichLinks                bool
 	ChatBridgeResult         bool
+}
+
+type ConnectorHealth struct {
+	ServerVersion     string
+	OSVersion         string
+	ProxyService      string
+	PrivateAPI        bool
+	HelperConnected   *bool
+	WSConnected       bool
+	ConnectedSince    time.Time
+	DisconnectedSince time.Time
+	LastEventAt       time.Time
+	ReconnectCount    int64
+	LastDisconnectErr string
+	LastCatchUpAt     time.Time
+	LastCatchUpChats  int
+	LastCatchUpMsgs   int
+	LastCatchUpErr    string
+	ServerInfoErr     string
 }
 
 type PushKeyRequest struct {

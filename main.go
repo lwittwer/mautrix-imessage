@@ -80,6 +80,7 @@ type IMBridge struct {
 	portalsByMXID map[id.RoomID]*Portal
 	portalsByGUID map[string]*Portal
 	portalsLock   sync.Mutex
+	dmBindLock    sync.Mutex
 	userCache     map[id.UserID]*User
 	puppets       map[string]*Puppet
 	puppetsLock   sync.Mutex
@@ -253,6 +254,34 @@ func (br *IMBridge) GetZLog() *zerolog.Logger {
 
 func (br *IMBridge) GetConnectorConfig() *imessage.PlatformConfig {
 	return &br.Config.IMessage
+}
+
+func (br *IMBridge) GetKV(key string) string {
+	if br == nil || br.DB == nil || br.DB.KV == nil {
+		return ""
+	}
+	return br.DB.KV.Get(key)
+}
+
+func (br *IMBridge) SetKV(key, value string) {
+	if br == nil || br.DB == nil || br.DB.KV == nil {
+		return
+	}
+	br.DB.KV.Set(key, value)
+}
+
+func (br *IMBridge) DeleteKV(key string) {
+	if br == nil || br.DB == nil || br.DB.KV == nil {
+		return
+	}
+	br.DB.KV.Delete(key)
+}
+
+func (br *IMBridge) IsCaptionInMessage() bool {
+	if br == nil || br.Config == nil {
+		return false
+	}
+	return br.Config.Bridge.CaptionInMessage
 }
 
 func (br *IMBridge) ipcResetEncryption(_ json.RawMessage) interface{} {

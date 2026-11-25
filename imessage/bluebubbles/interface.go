@@ -71,14 +71,14 @@ type MessageQueryRequest struct {
 type MessageQueryWith string
 
 const (
-	MessageQueryWithChat             ChatQueryWith = "chat"
-	MessageQueryWithChatParticipants ChatQueryWith = "chat.participants"
-	MessageQueryWithAttachment       ChatQueryWith = "attachment"
-	MessageQueryWithHandle           ChatQueryWith = "handle"
-	MessageQueryWithSMS              ChatQueryWith = "sms"
-	MessageQueryWithAttributeBody    ChatQueryWith = "message.attributedBody"
-	MessageQueryWithMessageSummary   ChatQueryWith = "message.messageSummaryInfo"
-	MessageQueryWithPayloadData      ChatQueryWith = "message.payloadData"
+	MessageQueryWithChat             MessageQueryWith = "chat"
+	MessageQueryWithChatParticipants MessageQueryWith = "chat.participants"
+	MessageQueryWithAttachment       MessageQueryWith = "attachment"
+	MessageQueryWithHandle           MessageQueryWith = "handle"
+	MessageQueryWithSMS              MessageQueryWith = "sms"
+	MessageQueryWithAttributeBody    MessageQueryWith = "message.attributedBody"
+	MessageQueryWithMessageSummary   MessageQueryWith = "message.messageSummaryInfo"
+	MessageQueryWithPayloadData      MessageQueryWith = "message.payloadData"
 )
 
 type MessageQueryResponse struct {
@@ -350,13 +350,31 @@ type MessageReadResponse struct {
 }
 
 type ServerInfo struct {
-	PrivateAPI bool `json:"private_api"`
+	OSVersion       string `json:"os_version,omitempty"`
+	ServerVersion   string `json:"server_version,omitempty"`
+	PrivateAPI      bool   `json:"private_api"`
+	HelperConnected *bool  `json:"helper_connected,omitempty"`
+	ProxyService    string `json:"proxy_service,omitempty"`
 }
 
 type ServerInfoResponse struct {
 	Status  int64      `json:"status"`
 	Message string     `json:"message"`
 	Data    ServerInfo `json:"data"`
+}
+
+type UpdateChatRequest struct {
+	DisplayName string `json:"displayName"`
+}
+
+type ChatParticipantRequest struct {
+	Address string `json:"address"`
+}
+
+type GenericResponse struct {
+	Status  int64  `json:"status"`
+	Message string `json:"message"`
+	Error   any    `json:"error,omitempty"`
 }
 
 type ResolveIdentifierResponse struct {
