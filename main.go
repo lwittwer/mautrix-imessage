@@ -255,6 +255,20 @@ func (br *IMBridge) GetConnectorConfig() *imessage.PlatformConfig {
 	return &br.Config.IMessage
 }
 
+func (br *IMBridge) GetKV(key string) string {
+	if br == nil || br.DB == nil || br.DB.KV == nil {
+		return ""
+	}
+	return br.DB.KV.Get(key)
+}
+
+func (br *IMBridge) SetKV(key, value string) {
+	if br == nil || br.DB == nil || br.DB.KV == nil {
+		return
+	}
+	br.DB.KV.Set(key, value)
+}
+
 func (br *IMBridge) ipcResetEncryption(_ json.RawMessage) interface{} {
 	br.Crypto.Reset(true)
 	return PingResponse{true}

@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/binary"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
 	log "maunium.net/go/maulogger/v2"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/appservice"
 	"maunium.net/go/mautrix/bridge/bridgeconfig"
 	"maunium.net/go/mautrix/event"
@@ -401,5 +404,313 @@ func TestPortalPowerLevelsGroupAdmin(t *testing.T) {
 	smsPLs := smsGroup.GetBasePowerLevels()
 	if smsPLs.Invite() != 99 || smsPLs.Kick() != 99 {
 		t.Fatalf("expected SMS group to stay locked at 99, got invite=%d kick=%d", smsPLs.Invite(), smsPLs.Kick())
+	}
+
+	// Sequoia any;+; group stays locked until its service is confirmed as iMessage
+	anyGroup := &Portal{
+		Portal:     &database.Portal{GUID: "any;+;chat789"},
+		bridge:     br,
+		log:        log.DefaultLogger,
+		Identifier: imessage.ParseIdentifier("any;+;chat789"),
+	}
+	if anyGroup.canManageGroup() {
+		t.Fatal("expected any;+; group with unknown service not to enable group admin")
+	}
+	if pls := anyGroup.GetBasePowerLevels(); pls.Invite() != 99 || pls.Kick() != 99 {
+		t.Fatalf("expected unknown-service any;+; group locked at 99, got invite=%d kick=%d", pls.Invite(), pls.Kick())
+	}
+	anyGroup.noteMessageService("SMS")
+	if anyGroup.canManageGroup() {
+		t.Fatal("expected any;+; group with SMS service not to enable group admin")
+	}
+	anyGroup.noteMessageService("iMessage")
+	if !anyGroup.canManageGroup() {
+		t.Fatal("expected any;+; group with confirmed iMessage service to enable group admin")
+	}
+	if pls := anyGroup.GetBasePowerLevels(); pls.Invite() != 50 || pls.Kick() != 50 {
+		t.Fatalf("expected confirmed iMessage any;+; group to allow invite/kick at 50, got invite=%d kick=%d", pls.Invite(), pls.Kick())
+	}
+}
+
+type fakeTestIMAPI struct {
+	imessage.API
+	resolvedGUID      string
+	backfillMessages  []*imessage.Message
+	lastSendFileMime  string
+	lastSendFileVoice bool
+	sendFileCalled    bool
+}
+
+func (f *fakeTestIMAPI) Capabilities() imessage.ConnectorCapabilities {
+	return imessage.ConnectorCapabilities{MessageSendResponses: true}
+}
+
+func (f *fakeTestIMAPI) ResolveIdentifier(identifier string) (string, error) {
+	return f.resolvedGUID, nil
+}
+
+func (f *fakeTestIMAPI) PrepareDM(guid string) error { return nil }
+
+func (f *fakeTestIMAPI) GetMessagesSinceDate(chatID string, minDate time.Time, backfillID string) ([]*imessage.Message, error) {
+	return f.backfillMessages, nil
+}
+
+func (f *fakeTestIMAPI) SendBackfillResult(chatID, backfillID string, success bool, idMap map[string][]id.EventID) {
+}
+
+func (f *fakeTestIMAPI) SendMessageBridgeResult(chatID, messageID string, eventID id.EventID, success bool) {
+}
+
+func (f *fakeTestIMAPI) SendFile(chatID, text, filename string, pathOnDisk string, replyTo string, replyToPart int, mimeType string, voiceMemo bool, metadata imessage.MessageMetadata) (*imessage.SendResponse, error) {
+	f.sendFileCalled = true
+	f.lastSendFileMime = mimeType
+	f.lastSendFileVoice = voiceMemo
+	return &imessage.SendResponse{GUID: "sent-file-1", Service: "SMS", ChatGUID: chatID, Time: time.Now()}, nil
+}
+
+func (f *fakeTestIMAPI) SendFileCleanup(sendFileDir string) {
+	_ = os.RemoveAll(sendFileDir)
+}
+
+func TestStartChatReusesExistingRoomWhenResolveReturnsAny(t *testing.T) {
+	rawDB, err := dbutil.NewWithDialect("file:startchat_any_reuse_test?mode=memory&cache=shared&_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	defer rawDB.Close()
+
+	db := database.New(rawDB, log.DefaultLogger)
+	if err := db.Upgrade(); err != nil {
+		t.Fatalf("database upgrade failed: %v", err)
+	}
+
+	zlog := zerolog.Nop()
+	br := &IMBridge{
+		DB:            db,
+		Config:        &config.Config{BaseConfig: &bridgeconfig.BaseConfig{}},
+		portalsByGUID: make(map[string]*Portal),
+		portalsByMXID: make(map[id.RoomID]*Portal),
+		IM:            &fakeTestIMAPI{resolvedGUID: "any;-;+15551234567"},
+	}
+	br.Log = log.DefaultLogger
+	br.ZLog = &zlog
+
+	// Pre-existing iMessage;-; portal with a Matrix room (pre-Sequoia migration state)
+	dbPortal := db.Portal.New()
+	dbPortal.GUID = "iMessage;-;+15551234567"
+	dbPortal.MXID = id.RoomID("!original-room:example.com")
+	dbPortal.Insert(nil)
+
+	mx := &WebsocketCommandHandler{bridge: br, log: log.DefaultLogger}
+	resp, err := mx.StartChat(StartDMRequest{
+		Identifier:    "+15551234567",
+		ActuallyStart: true,
+	})
+	if err != nil {
+		t.Fatalf("StartChat failed: %v", err)
+	}
+	if resp.RoomID != "!original-room:example.com" || resp.GUID != "iMessage;-;+15551234567" || resp.JustCreated {
+		t.Fatalf("expected StartChat to reuse original room without creating a new one, got %+v", resp)
+	}
+}
+
+func TestAnyPortalPersistsServiceAcrossRestartForOutboundVoice(t *testing.T) {
+	rawDB, err := dbutil.NewWithDialect("file:any_service_restart_test?mode=memory&cache=shared&_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	defer rawDB.Close()
+
+	db := database.New(rawDB, log.DefaultLogger)
+	if err := db.Upgrade(); err != nil {
+		t.Fatalf("database upgrade failed: %v", err)
+	}
+
+	zlog := zerolog.Nop()
+	// First run: receive an SMS message on an any;-; portal so its service is persisted.
+	br1 := &IMBridge{
+		DB:            db,
+		Config:        &config.Config{BaseConfig: &bridgeconfig.BaseConfig{}},
+		portalsByGUID: make(map[string]*Portal),
+		portalsByMXID: make(map[id.RoomID]*Portal),
+		IM:            &fakeTestIMAPI{},
+	}
+	br1.Log = log.DefaultLogger
+	br1.ZLog = &zlog
+
+	dbPortal := db.Portal.New()
+	dbPortal.GUID = "any;-;+15557654321"
+	dbPortal.LastSeenHandle = "any;-;+15557654321"
+	dbPortal.Insert(nil)
+
+	p1 := br1.NewPortal(dbPortal)
+	p1.noteMessageService("SMS")
+
+	// Simulate restart: brand-new IMBridge loading the portal fresh from SQLite.
+	fakeIM := &fakeTestIMAPI{}
+	mediaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Minimal OggS header so mimetype.Detect sees audio/ogg
+		_, _ = w.Write([]byte("OggS\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x13OpusHead\x01\x01\x00\x00\x80\xbb\x00\x00\x00\x00\x00"))
+	}))
+	defer mediaSrv.Close()
+
+	mxClient, err := mautrix.NewClient(mediaSrv.URL, "@imessage_15557654321:example.com", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	br2 := &IMBridge{
+		DB:            db,
+		Config:        &config.Config{BaseConfig: &bridgeconfig.BaseConfig{}},
+		portalsByGUID: make(map[string]*Portal),
+		portalsByMXID: make(map[id.RoomID]*Portal),
+		puppets:       make(map[string]*Puppet),
+		IM:            fakeIM,
+	}
+	br2.Log = log.DefaultLogger
+	br2.ZLog = &zlog
+	br2.puppets["+15557654321"] = &Puppet{
+		Puppet: &database.Puppet{ID: "+15557654321"},
+		bridge: br2,
+		MXID:   "@imessage_15557654321:example.com",
+		Intent: &appservice.IntentAPI{Client: mxClient, UserID: "@imessage_15557654321:example.com"},
+	}
+
+	reloaded := br2.GetPortalByGUID("any;-;+15557654321")
+	if got := reloaded.effectiveService(); got != "SMS" {
+		t.Fatalf("expected reloaded any;-; portal to recover persisted service 'SMS', got %q", got)
+	}
+
+	// Send an MSC3245 voice message BEFORE any incoming message after restart:
+	// must NOT attempt CAF conversion (which would also fail without ffmpeg / send audio/x-caf).
+	evt := &event.Event{
+		ID: "$voice-out-1",
+		Content: event.Content{
+			Raw: map[string]any{
+				"org.matrix.msc3245.voice": map[string]any{},
+			},
+		},
+	}
+	mxc := id.ContentURI{Homeserver: "example.com", FileID: "voice1"}
+	if _, err := reloaded.handleMatrixMediaDirect(mxc, nil, "voice.ogg", "", evt, "", 0, nil); err != nil {
+		t.Fatalf("handleMatrixMediaDirect failed on SMS any;-; portal after restart: %v", err)
+	}
+	if !fakeIM.sendFileCalled || fakeIM.lastSendFileVoice || fakeIM.lastSendFileMime == "audio/x-caf" {
+		t.Fatalf("expected SMS voice send to skip CAF conversion, called=%v voiceMemo=%v mime=%q", fakeIM.sendFileCalled, fakeIM.lastSendFileVoice, fakeIM.lastSendFileMime)
+	}
+}
+
+func TestForwardBackfillAndHandleiMessageCleanUpTempAttachments(t *testing.T) {
+	rawDB, err := dbutil.NewWithDialect("file:temp_att_cleanup_test?mode=memory&cache=shared&_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	defer rawDB.Close()
+
+	db := database.New(rawDB, log.DefaultLogger)
+	if err := db.Upgrade(); err != nil {
+		t.Fatalf("database upgrade failed: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	makeFile := func(name string) string {
+		p := filepath.Join(tmpDir, name)
+		if err := os.WriteFile(p, []byte("payload"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	bfTemp := makeFile("bf-dup-temp.bin")
+	bfKeep := makeFile("bf-dup-keep.bin")
+	echoTemp := makeFile("echo-dup-temp.bin")
+	echoKeep := makeFile("echo-dup-keep.bin")
+	timeoutTemp := makeFile("timeout-dup-temp.bin")
+
+	fakeIM := &fakeTestIMAPI{
+		backfillMessages: []*imessage.Message{
+			{
+				GUID:     "dup-msg-1",
+				ChatGUID: "iMessage;-;+15551234567",
+				Text:     "already bridged",
+				Time:     time.Now(),
+				Attachments: []*imessage.Attachment{
+					{GUID: "a1", PathOnDisk: bfTemp, IsTemp: true},
+					{GUID: "a2", PathOnDisk: bfKeep, IsTemp: false},
+				},
+			},
+		},
+	}
+
+	zlog := zerolog.Nop()
+	br := &IMBridge{
+		DB:     db,
+		Config: &config.Config{BaseConfig: &bridgeconfig.BaseConfig{}},
+		IM:     fakeIM,
+		user:   &User{User: &database.User{MXID: "@me:example.com"}},
+	}
+	br.Log = log.DefaultLogger
+	br.ZLog = &zlog
+
+	dbPortal := db.Portal.New()
+	dbPortal.GUID = "iMessage;-;+15551234567"
+	dbPortal.MXID = id.RoomID("!room:example.com")
+	dbPortal.Insert(nil)
+
+	existing := db.Message.New()
+	existing.PortalGUID = dbPortal.GUID
+	existing.GUID = "dup-msg-1"
+	existing.Part = 0
+	existing.MXID = "$existing-evt"
+	existing.SenderGUID = dbPortal.GUID
+	existing.Timestamp = time.Now().Add(-time.Minute).UnixMilli()
+	existing.Insert(nil)
+
+	portal := &Portal{
+		Portal:       dbPortal,
+		bridge:       br,
+		log:          log.DefaultLogger,
+		Identifier:   imessage.ParseIdentifier(dbPortal.GUID),
+		messageDedup: map[string]SentMessage{"timeout.jpg": {EventID: "$timeout-evt", Timestamp: time.Now()}},
+	}
+
+	// 1. forwardBackfill skips duplicate message and MUST clean up IsTemp attachment while keeping non-temp.
+	portal.forwardBackfill()
+	if _, err := os.Stat(bfTemp); !os.IsNotExist(err) {
+		t.Fatalf("expected forwardBackfill duplicate temp attachment to be deleted, stat err=%v", err)
+	}
+	if _, err := os.Stat(bfKeep); err != nil {
+		t.Fatalf("expected non-temp attachment in forwardBackfill to remain untouched: %v", err)
+	}
+
+	// 2. HandleiMessage duplicate echo (e.g. own outbound media echoed back by BlueBubbles) cleans up IsTemp.
+	portal.HandleiMessage(&imessage.Message{
+		GUID:     "dup-msg-1",
+		ChatGUID: dbPortal.GUID,
+		IsFromMe: true,
+		Time:     time.Now(),
+		Attachments: []*imessage.Attachment{
+			{GUID: "a3", PathOnDisk: echoTemp, IsTemp: true},
+			{GUID: "a4", PathOnDisk: echoKeep, IsTemp: false},
+		},
+	})
+	if _, err := os.Stat(echoTemp); !os.IsNotExist(err) {
+		t.Fatalf("expected HandleiMessage duplicate echo temp attachment to be deleted, stat err=%v", err)
+	}
+	if _, err := os.Stat(echoKeep); err != nil {
+		t.Fatalf("expected non-temp attachment in HandleiMessage to remain untouched: %v", err)
+	}
+
+	// 3. HandleiMessage timeout-dedup echo (getIntentForMessage returns nil) cleans up IsTemp.
+	portal.HandleiMessage(&imessage.Message{
+		GUID:     "timeout-echo-guid",
+		ChatGUID: dbPortal.GUID,
+		IsFromMe: true,
+		Time:     time.Now(),
+		Attachments: []*imessage.Attachment{
+			{GUID: "a5", FileName: "timeout.jpg", PathOnDisk: timeoutTemp, IsTemp: true},
+		},
+	})
+	if _, err := os.Stat(timeoutTemp); !os.IsNotExist(err) {
+		t.Fatalf("expected HandleiMessage timeout-dedup temp attachment to be deleted, stat err=%v", err)
 	}
 }

@@ -219,6 +219,11 @@ func (br *IMBridge) NewPortal(dbPortal *database.Portal) *Portal {
 		backfillStart:   make(chan struct{}),
 	}
 	portal.log = maulogadapt.ZeroAsMau(&portal.zlog)
+	if portal.Identifier.Service == "any" && br.DB != nil && br.DB.KV != nil {
+		if savedSvc := br.DB.KV.Get(database.KVPortalServicePrefix + dbPortal.GUID); savedSvc != "" && savedSvc != "any" {
+			portal.lastSeenService = savedSvc
+		}
+	}
 	if !br.IM.Capabilities().MessageSendResponses {
 		portal.messageDedup = make(map[string]SentMessage)
 	}
@@ -270,7 +275,7 @@ var (
 	//	_ bridge.DisappearingPortal = (*Portal)(nil)
 )
 
-func (portal *Portal) effectiveService() string {
+func (portal *Portal) knownService() string {
 	if portal.Identifier.Service != "" && portal.Identifier.Service != "any" {
 		return portal.Identifier.Service
 	}
@@ -280,10 +285,28 @@ func (portal *Portal) effectiveService() string {
 	if svc != "" && svc != "any" {
 		return svc
 	}
+	if portal.bridge != nil && portal.bridge.DB != nil && portal.bridge.DB.KV != nil {
+		if saved := portal.bridge.DB.KV.Get(database.KVPortalServicePrefix + portal.GUID); saved != "" && saved != "any" {
+			portal.serviceLock.Lock()
+			if portal.lastSeenService == "" {
+				portal.lastSeenService = saved
+			}
+			svc = portal.lastSeenService
+			portal.serviceLock.Unlock()
+			return svc
+		}
+	}
 	if portal.LastSeenHandle != "" {
 		if parsed := imessage.ParseIdentifier(portal.LastSeenHandle); parsed.Service != "" && parsed.Service != "any" {
 			return parsed.Service
 		}
+	}
+	return ""
+}
+
+func (portal *Portal) effectiveService() string {
+	if svc := portal.knownService(); svc != "" {
+		return svc
 	}
 	return "iMessage"
 }
@@ -298,9 +321,14 @@ func (portal *Portal) noteMessageService(service string) {
 		portal.lastSeenService = service
 	}
 	portal.serviceLock.Unlock()
-	if changed && len(portal.MXID) > 0 {
-		portal.log.Debugfln("Updated effective service for %s to %s", portal.GUID, service)
-		portal.UpdateBridgeInfo()
+	if changed {
+		if portal.bridge != nil && portal.bridge.DB != nil && portal.bridge.DB.KV != nil {
+			portal.bridge.DB.KV.Set(database.KVPortalServicePrefix+portal.GUID, service)
+		}
+		if len(portal.MXID) > 0 {
+			portal.log.Debugfln("Updated effective service for %s to %s", portal.GUID, service)
+			portal.UpdateBridgeInfo()
+		}
 	}
 }
 
@@ -396,6 +424,9 @@ func (portal *Portal) UpdateName(name string, intent *appservice.IntentAPI) *id.
 
 func (portal *Portal) SyncWithInfo(chatInfo *imessage.ChatInfo) {
 	portal.zlog.Debug().Interface("chat_info", chatInfo).Msg("Syncing with chat info")
+	if chatInfo.Service != "" {
+		portal.noteMessageService(chatInfo.Service)
+	}
 	update := false
 	if chatInfo.ThreadID != "" && chatInfo.ThreadID != portal.ThreadID {
 		portal.log.Infofln("Found portal thread ID in sync: %s (prev: %s)", chatInfo.ThreadID, portal.ThreadID)
@@ -650,7 +681,7 @@ func (portal *Portal) canManageGroup() bool {
 		portal.bridge != nil &&
 		portal.bridge.IM != nil &&
 		portal.bridge.IM.Capabilities().GroupAdmin &&
-		portal.effectiveService() != "SMS"
+		portal.knownService() == "iMessage"
 }
 
 func (portal *Portal) GetBasePowerLevels() *event.PowerLevelsEventContent {
@@ -909,6 +940,9 @@ func (portal *Portal) CreateMatrixRoom(chatInfo *imessage.ChatInfo, profileOverr
 	if chatInfo != nil {
 		portal.Name = chatInfo.DisplayName
 		portal.ThreadID = chatInfo.ThreadID
+		if chatInfo.Service != "" {
+			portal.noteMessageService(chatInfo.Service)
+		}
 	} else {
 		portal.log.Warnln("Didn't get any chat info")
 	}
@@ -1418,6 +1452,7 @@ func (portal *Portal) HandleMatrixMessage(evt *event.Event) {
 		}
 		portal.sendErrorMessage(evt, err, humanReadable, certain, statusCode, "")
 	} else if resp != nil {
+		portal.noteMessageService(resp.Service)
 		portal.sendDeliveryReceipt(evt.ID, resp.Service, resp.ChatGUID, !portal.bridge.IM.Capabilities().MessageStatusCheckpoints)
 		if !wasEdit {
 			dbMessage := portal.bridge.DB.Message.New()
@@ -2319,6 +2354,8 @@ func (portal *Portal) getIntentForMessage(msg *imessage.Message, dbMessage *data
 }
 
 func (portal *Portal) HandleiMessage(msg *imessage.Message) id.EventID {
+	defer msg.CleanupTempAttachments()
+
 	var dbMessage *database.Message
 	var overrideSuccess bool
 

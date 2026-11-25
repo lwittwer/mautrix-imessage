@@ -113,11 +113,13 @@ func (portal *Portal) forwardBackfill() {
 		if msg.Tapback != nil {
 			if portal.bridge.DB.Tapback.GetByTapbackGUID(portal.GUID, msg.GUID) != nil {
 				portal.log.Debugfln("Skipping duplicate tapback %s in forward backfill batch", msg.GUID)
+				msg.CleanupTempAttachments()
 				continue
 			}
 		} else if portal.bridge.DB.Message.GetByGUID(msg.ChatGUID, msg.GUID, 0) != nil ||
 			portal.bridge.DB.Message.GetByGUID(portal.GUID, msg.GUID, 0) != nil {
 			portal.log.Debugfln("Skipping duplicate message %s in forward backfill batch", msg.GUID)
+			msg.CleanupTempAttachments()
 			continue
 		}
 		filtered = append(filtered, msg)
@@ -243,6 +245,11 @@ func (portal *Portal) convertTapbacks(messages []*imessage.Message) ([]*event.Ev
 }
 
 func (portal *Portal) sendBackfill(backfillID string, messages []*imessage.Message, forward, forwardIfNoMessages, markAsRead bool) (success bool) {
+	defer func() {
+		for _, msg := range messages {
+			msg.CleanupTempAttachments()
+		}
+	}()
 	idMap := make(map[string][]id.EventID, len(messages))
 	for _, msg := range messages {
 		idMap[msg.GUID] = []id.EventID{}

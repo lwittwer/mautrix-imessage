@@ -36,6 +36,7 @@ const (
 	KVBridgeInfoVersion     = "bridge_info_version"
 	KVLookedForPortals      = "looked_for_portals"
 	KVDoublePuppetLoggedOut = "double_puppet_logged_out"
+	KVPortalServicePrefix   = "portal_service:"
 
 	ExpectedBridgeInfoVersion = "1"
 )

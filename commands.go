@@ -492,8 +492,12 @@ func requirePortalGroupAdmin(ce *WrappedCommandEvent) (imessage.GroupAdminAPI, b
 		ce.Reply("Group management is not supported (requires BlueBubbles Private API).")
 		return nil, false
 	}
-	if ce.Portal.effectiveService() == "SMS" {
-		ce.Reply("SMS/MMS group chats cannot be modified.")
+	if ce.Portal.knownService() != "iMessage" {
+		if ce.Portal.knownService() == "SMS" {
+			ce.Reply("SMS/MMS group chats cannot be modified.")
+		} else {
+			ce.Reply("This group's service is not yet confirmed as iMessage; wait for a message or run `sync` first.")
+		}
 		return nil, false
 	}
 	return groupAdmin, true

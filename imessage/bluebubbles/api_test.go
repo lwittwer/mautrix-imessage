@@ -29,6 +29,7 @@ type fakeBridge struct {
 	mu            sync.Mutex
 	statuses      []imessage.BridgeStatus
 	messagesSince map[string][]string
+	kv            map[string]string
 }
 
 func newFakeBridge(url, password string) *fakeBridge {
@@ -65,6 +66,22 @@ func (f *fakeBridge) GetMessagesSince(chatGUID string, since time.Time) []string
 	return append([]string(nil), f.messagesSince[chatGUID]...)
 }
 func (f *fakeBridge) SetPushKey(req *imessage.PushKeyRequest) {}
+func (f *fakeBridge) GetKV(key string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.kv == nil {
+		return ""
+	}
+	return f.kv[key]
+}
+func (f *fakeBridge) SetKV(key, value string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.kv == nil {
+		f.kv = make(map[string]string)
+	}
+	f.kv[key] = value
+}
 
 func (f *fakeBridge) getStatuses() []imessage.BridgeStatus {
 	f.mu.Lock()
@@ -1632,5 +1649,332 @@ func TestGroupAdminAPIAndRenameEchoSuppression(t *testing.T) {
 	}
 	if !gotLeft {
 		t.Fatal("expected group leave POST call")
+	}
+}
+
+func TestReconnectCatchUpRecoversPreWindowRetraction(t *testing.T) {
+	now := time.Now()
+	since := now.Add(-1 * time.Minute)
+	twoHoursAgoMs := now.Add(-2 * time.Hour).UnixMilli()
+	tenMinsAgoMs := now.Add(-10 * time.Minute).UnixMilli()
+	retractedDuringDisconnectMs := now.Add(-15 * time.Second).UnixMilli()
+
+	var attachmentCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/chat/query":
+			_ = json.NewEncoder(w).Encode(ChatQueryResponse{
+				Status: 200,
+				Data: []Chat{
+					{
+						// Quiet chat whose last message was created 2 hours ago, then retracted during disconnect.
+						GUID: "iMessage;-;+15551000001",
+						LastMessage: &Message{
+							GUID:          "old-retracted-last",
+							DateCreated:   twoHoursAgoMs,
+							DateRetracted: retractedDuringDisconnectMs,
+							Handle:        Handle{Address: "+15551000001", Service: "iMessage"},
+							Attachments:   []Attachment{{GUID: "att-old", TransferName: "pic.jpg", MimeType: "image/jpeg"}},
+						},
+					},
+					{
+						// Chat with a message created 10m ago (pre-window, within 20m lookback) retracted during disconnect.
+						GUID: "iMessage;-;+15551000002",
+						LastMessage: &Message{
+							GUID:        "recent-normal",
+							DateCreated: tenMinsAgoMs + 5000,
+							Text:        "still here",
+							Handle:      Handle{Address: "+15551000002", Service: "iMessage"},
+						},
+					},
+				},
+				Metadata: PageMetadata{Total: 2, Limit: 1000, Offset: 0, Count: 2},
+			})
+		case "/api/v1/chat/iMessage;-;+15551000001/message":
+			// Query uses 20m lookback, so the 2-hour-old message is not returned here;
+			// catch-up must still discover it via chat.LastMessage.
+			_ = json.NewEncoder(w).Encode(MessageQueryResponse{
+				Status:   200,
+				Data:     []Message{},
+				Metadata: PageMetadata{Total: 0, Limit: 100, Offset: 0, Count: 0},
+			})
+		case "/api/v1/chat/iMessage;-;+15551000002/message":
+			_ = json.NewEncoder(w).Encode(MessageQueryResponse{
+				Status: 200,
+				Data: []Message{
+					{
+						GUID:        "recent-normal",
+						DateCreated: tenMinsAgoMs + 5000,
+						Text:        "still here",
+						Handle:      Handle{Address: "+15551000002", Service: "iMessage"},
+					},
+					{
+						GUID:          "prewindow-retracted-earlier",
+						DateCreated:   tenMinsAgoMs,
+						DateRetracted: retractedDuringDisconnectMs,
+						Handle:        Handle{Address: "+15551000002", Service: "iMessage"},
+					},
+				},
+				Metadata: PageMetadata{Total: 2, Limit: 100, Offset: 0, Count: 2},
+			})
+		default:
+			if strings.HasPrefix(r.URL.Path, "/api/v1/attachment/") {
+				attachmentCalls.Add(1)
+			}
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+	bb.runReconnectCatchUp(since)
+
+	got := make(map[string]*imessage.Message)
+	for {
+		select {
+		case msg := <-bb.MessageChan():
+			got[msg.GUID] = msg
+		default:
+			goto done
+		}
+	}
+done:
+	if len(got) != 2 {
+		t.Fatalf("expected exactly 2 pre-window retractions (and no untouched old messages), got %d: %+v", len(got), got)
+	}
+	if m1 := got["old-retracted-last"]; m1 == nil || !m1.IsRetracted || m1.ChatGUID != "iMessage;-;+15551000001" {
+		t.Fatalf("expected 2h-old quiet-chat retraction to be recovered, got %+v", m1)
+	}
+	if m2 := got["prewindow-retracted-earlier"]; m2 == nil || !m2.IsRetracted || m2.ChatGUID != "iMessage;-;+15551000002" {
+		t.Fatalf("expected 10m-old pre-window retraction to be recovered, got %+v", m2)
+	}
+	if attachmentCalls.Load() != 0 {
+		t.Fatalf("expected 0 attachment downloads for retracted messages, got %d", attachmentCalls.Load())
+	}
+}
+
+func TestCreateGroupPreservesSMSServiceThroughAnyChat(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		gotCreate []CreateChatRequest
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/handle/+15551111111":
+			_ = json.NewEncoder(w).Encode(ResolveIdentifierResponse{
+				Status: 200,
+				Data:   Handle{Address: "+15551111111", Service: "SMS"},
+			})
+		case "/api/v1/chat/any;-;+15551111111":
+			_ = json.NewEncoder(w).Encode(ChatResponse{
+				Status: 200,
+				Data:   &Chat{GUID: "any;-;+15551111111"},
+			})
+		case "/api/v1/handle/+15552222222":
+			_ = json.NewEncoder(w).Encode(ResolveIdentifierResponse{
+				Status: 200,
+				Data:   Handle{Address: "+15552222222", Service: "iMessage"},
+			})
+		case "/api/v1/handle/+15553333333":
+			_ = json.NewEncoder(w).Encode(ResolveIdentifierResponse{
+				Status: 200,
+				Data:   Handle{Address: "+15553333333", Service: "SMS"},
+			})
+		case "/api/v1/chat/new":
+			var req CreateChatRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			mu.Lock()
+			gotCreate = append(gotCreate, req)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(CreateChatResponse{
+				Status: 200,
+				Data:   Chat{GUID: "SMS;+;chat777", GroupID: "grp-777"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+	bb.usingPrivateAPI.Store(true)
+
+	// ResolveIdentifier returns any;-;+15551111111 for the SMS participant because the any chat exists.
+	g1, err := bb.ResolveIdentifier("+15551111111")
+	if err != nil || g1 != "any;-;+15551111111" {
+		t.Fatalf("expected any;-;+15551111111, got %q (err=%v)", g1, err)
+	}
+	g2, err := bb.ResolveIdentifier("+15552222222")
+	if err != nil || g2 != "iMessage;-;+15552222222" {
+		t.Fatalf("expected iMessage;-;+15552222222, got %q (err=%v)", g2, err)
+	}
+
+	// CreateGroupWithMessage must still submit service="SMS" using the preserved resolved service.
+	if _, err := bb.CreateGroupWithMessage([]string{g1, g2}, "Hello mixed group"); err != nil {
+		t.Fatalf("CreateGroupWithMessage failed: %v", err)
+	}
+	if len(gotCreate) != 1 || gotCreate[0].Service != "SMS" {
+		t.Fatalf("expected outbound CreateChatRequest.Service='SMS', got %+v", gotCreate)
+	}
+
+	// Also verify direct any;-; participant (without prior ResolveIdentifier) probes handle service.
+	if _, err := bb.CreateGroupWithMessage([]string{"any;-;+15553333333", g2}, "Hello direct any"); err != nil {
+		t.Fatalf("CreateGroupWithMessage direct any failed: %v", err)
+	}
+	if len(gotCreate) != 2 || gotCreate[1].Service != "SMS" {
+		t.Fatalf("expected direct any;-; SMS participant to yield service='SMS', got %+v", gotCreate)
+	}
+}
+
+func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
+	var attachmentCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/attachment/") {
+			attachmentCalls.Add(1)
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	// Shared bridge with persistent KV store
+	fb := newFakeBridge(srv.URL, "secret-pw")
+	api1, err := NewBlueBubblesConnector(fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bb1 := api1.(*blueBubbles)
+
+	initialEdit := json.RawMessage(`{
+		"guid": "msg-persist-1",
+		"isFromMe": true,
+		"text": "edited once",
+		"dateCreated": 1700000000000,
+		"dateEdited": 1700000005000,
+		"chats": [{"guid": "iMessage;-;+15551234567"}]
+	}`)
+	if err := bb1.handleMessageUpdated(initialEdit); err != nil {
+		t.Fatalf("bb1.handleMessageUpdated failed: %v", err)
+	}
+	select {
+	case msg := <-bb1.MessageChan():
+		if msg.GUID != "msg-persist-1" || !msg.IsEdited {
+			t.Fatalf("unexpected initial edit: %+v", msg)
+		}
+	default:
+		t.Fatal("expected initial edit on bb1.MessageChan")
+	}
+
+	// Simulate bridge restart: brand new blueBubbles instance with empty in-memory lastEdited map
+	api2, err := NewBlueBubblesConnector(fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bb2 := api2.(*blueBubbles)
+
+	// Same dateEdited arrives after restart with dateRead and an attachment:
+	// must NOT re-emit duplicate edit, must NOT download attachments, and MUST emit read receipt.
+	postRestartRead := json.RawMessage(`{
+		"guid": "msg-persist-1",
+		"isFromMe": true,
+		"text": "edited once",
+		"dateCreated": 1700000000000,
+		"dateEdited": 1700000005000,
+		"dateRead": 1700000010000,
+		"chats": [{"guid": "iMessage;-;+15551234567"}],
+		"attachments": [{"guid": "att-1", "transferName": "pic.jpg", "mimeType": "image/jpeg"}]
+	}`)
+	if err := bb2.handleMessageUpdated(postRestartRead); err != nil {
+		t.Fatalf("bb2.handleMessageUpdated failed: %v", err)
+	}
+	select {
+	case dup := <-bb2.MessageChan():
+		t.Fatalf("expected persisted edit to suppress duplicate after restart, got %+v", dup)
+	default:
+	}
+	if attachmentCalls.Load() != 0 {
+		t.Fatalf("expected 0 attachment downloads on suppressed edit after restart, got %d", attachmentCalls.Load())
+	}
+	select {
+	case rr := <-bb2.ReadReceiptChan():
+		if rr.ReadUpTo != "msg-persist-1" {
+			t.Fatalf("unexpected read receipt: %+v", rr)
+		}
+	default:
+		t.Fatal("expected read receipt to still be forwarded after restart")
+	}
+
+	// A genuinely newer edit that ALSO carries dateDelivered must forward BOTH the edit AND delivered status.
+	newerEditWithDelivered := json.RawMessage(`{
+		"guid": "msg-persist-1",
+		"isFromMe": true,
+		"text": "edited twice",
+		"dateCreated": 1700000000000,
+		"dateEdited": 1700000020000,
+		"dateDelivered": 1700000021000,
+		"chats": [{"guid": "iMessage;-;+15551234567"}]
+	}`)
+	if err := bb2.handleMessageUpdated(newerEditWithDelivered); err != nil {
+		t.Fatalf("bb2.handleMessageUpdated newer edit failed: %v", err)
+	}
+	select {
+	case edited := <-bb2.MessageChan():
+		if edited.Text != "edited twice" {
+			t.Fatalf("unexpected newer edit: %+v", edited)
+		}
+	default:
+		t.Fatal("expected newer edit to reach MessageChan")
+	}
+	select {
+	case st := <-bb2.MessageStatusChan():
+		if st.GUID != "msg-persist-1" || st.Status != "delivered" {
+			t.Fatalf("unexpected delivery status: %+v", st)
+		}
+	default:
+		t.Fatal("expected delivered status to also be forwarded alongside new edit")
+	}
+}
+
+func TestHealthAndAnyChatLookupDoNotBlockOnRequestLock(t *testing.T) {
+	helperTrue := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/server/info":
+			_ = json.NewEncoder(w).Encode(ServerInfoResponse{
+				Status: 200,
+				Data:   ServerInfo{ServerVersion: "1.9.7", PrivateAPI: true, HelperConnected: &helperTrue},
+			})
+		case "/api/v1/chat/any;-;+15551112222":
+			_ = json.NewEncoder(w).Encode(ChatResponse{
+				Status: 200,
+				Data:   &Chat{GUID: "any;-;+15551112222"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+
+	// Hold bbRequestLock to simulate an in-flight long media upload.
+	bb.bbRequestLock.Lock()
+	defer bb.bbRequestLock.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h := bb.GetHealth()
+		if h.ServerVersion != "1.9.7" || h.ServerInfoErr != "" {
+			t.Errorf("unexpected health while request lock held: %+v", h)
+		}
+		if got := bb.lookupExistingAnyChat("+15551112222"); got != "any;-;+15551112222" {
+			t.Errorf("unexpected lookupExistingAnyChat while request lock held: %q", got)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("GetHealth or lookupExistingAnyChat blocked on bbRequestLock")
 	}
 }

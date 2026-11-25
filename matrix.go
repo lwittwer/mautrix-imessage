@@ -300,14 +300,24 @@ func (mx *WebsocketCommandHandler) StartChat(req StartDMRequest) (*StartDMRespon
 		mx.trackResolveIdentifier(!req.ActuallyStart, req.Identifier, "fail")
 		return nil, fmt.Errorf("can't start %s with non-numeric identifier", parsed.Service)
 	}
-	// On macOS Sequoia+, an existing DM portal may be keyed under "any;-;<localID>"
-	// even when handle resolution reports iMessage/SMS/RCS. Reuse it if present.
-	if !parsed.IsGroup && parsed.Service != "any" && parsed.LocalID != "" {
+	// On macOS Sequoia+, an existing DM portal may be keyed under either "any;-;<localID>"
+	// or a concrete service ("iMessage;-;", "RCS;-;", "SMS;-;"). Reuse an existing room in
+	// either direction to avoid creating duplicate rooms for the same contact.
+	if !parsed.IsGroup && parsed.LocalID != "" {
 		if existing := mx.bridge.GetPortalByGUIDIfExists(resp.GUID); existing == nil || len(existing.MXID) == 0 {
-			anyGUID := imessage.Identifier{Service: "any", LocalID: parsed.LocalID}.String()
-			if anyPortal := mx.bridge.GetPortalByGUIDIfExists(anyGUID); anyPortal != nil && len(anyPortal.MXID) > 0 {
-				resp.GUID = anyGUID
-				parsed = anyPortal.Identifier
+			var fallbackServices []string
+			if parsed.Service == "any" {
+				fallbackServices = []string{"iMessage", "RCS", "SMS"}
+			} else {
+				fallbackServices = []string{"any"}
+			}
+			for _, svc := range fallbackServices {
+				candGUID := imessage.Identifier{Service: svc, LocalID: parsed.LocalID}.String()
+				if candPortal := mx.bridge.GetPortalByGUIDIfExists(candGUID); candPortal != nil && len(candPortal.MXID) > 0 {
+					resp.GUID = candPortal.GUID
+					parsed = candPortal.Identifier
+					break
+				}
 			}
 		}
 	}

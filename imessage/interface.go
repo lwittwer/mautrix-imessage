@@ -74,6 +74,11 @@ type HealthAPI interface {
 	GetHealth() *ConnectorHealth
 }
 
+type KVStore interface {
+	GetKV(key string) string
+	SetKV(key, value string)
+}
+
 type API interface {
 	Start(readyCallback func()) error
 	Stop()

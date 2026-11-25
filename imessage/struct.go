@@ -17,6 +17,7 @@
 package imessage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,6 +87,21 @@ func (msg *Message) SenderText() string {
 		return "self"
 	}
 	return msg.Sender.LocalID
+}
+
+// CleanupTempAttachments removes any temporary on-disk attachment files created
+// by a connector (e.g. BlueBubbles downloads), ignoring already-deleted files.
+func (msg *Message) CleanupTempAttachments() {
+	if msg == nil {
+		return
+	}
+	for _, att := range msg.Attachments {
+		if att != nil && att.IsTemp && att.PathOnDisk != "" {
+			if err := att.Delete(); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.DefaultLogger.Warnfln("Failed to delete temp attachment %s in %s: %v", att.PathOnDisk, msg.GUID, err)
+			}
+		}
+	}
 }
 
 type ReadReceipt struct {
@@ -223,6 +239,7 @@ type ChatInfo struct {
 	NoCreateRoom bool     `json:"no_create_room"`
 	ThreadID     string   `json:"thread_id,omitempty"`
 	Delete       bool     `json:"delete,omitempty"`
+	Service      string   `json:"service,omitempty"`
 }
 
 type Identifier struct {
