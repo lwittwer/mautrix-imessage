@@ -2041,6 +2041,95 @@ func TestMergeChainedAndSlowDrainPreserveTargetBeforeTapback(t *testing.T) {
 		}
 	})
 
+	t.Run("chained_merge_tapback_between_merges", func(t *testing.T) {
+		roomA := id.RoomID("!between-a:example.com")
+		roomB := id.RoomID("!between-b:example.com")
+		roomC := id.RoomID("!between-c:example.com")
+		br, db, imh, sentEvts, cleanup := setupBridge(t, "chained_between_merges_test", roomA, roomB, roomC)
+		defer cleanup()
+
+		for _, item := range []struct {
+			guid string
+			room id.RoomID
+		}{
+			{"iMessage;-;a@example.com", roomA},
+			{"iMessage;-;b@example.com", roomB},
+			{"iMessage;-;+15558000001", roomC},
+		} {
+			row := db.Portal.New()
+			row.GUID = item.guid
+			row.MXID = item.room
+			row.Insert(nil)
+		}
+
+		portalA := br.GetPortalByGUID("iMessage;-;a@example.com")
+		portalB := br.GetPortalByGUID("iMessage;-;b@example.com")
+		portalC := br.GetPortalByGUID("iMessage;-;+15558000001")
+		defer portalC.stopLoop()
+
+		unpauseA := pausePortalLoop(t, portalA)
+		if ok, _ := portalA.enqueueMessage(&imessage.Message{
+			GUID:     "between-orig-1",
+			ChatGUID: portalA.GUID,
+			Sender:   imessage.Identifier{LocalID: "+15558000001", Service: "iMessage"},
+			Service:  "iMessage",
+			Text:     "original held on A",
+			Time:     time.Now(),
+		}, time.Second); !ok {
+			t.Fatal("failed to queue original on portalA")
+		}
+
+		// Merge A -> B, submit tapback to B BETWEEN the two merges, then merge B -> C while A stays paused.
+		portalB.Merge([]*Portal{portalA})
+		imh.HandleMessage(&imessage.Message{
+			GUID:     "between-tb-1",
+			ChatGUID: portalA.GUID,
+			Sender:   imessage.Identifier{LocalID: "+15558000001", Service: "iMessage"},
+			Service:  "iMessage",
+			Time:     time.Now(),
+			Tapback: &imessage.Tapback{
+				TargetGUID: "between-orig-1",
+				TargetPart: 0,
+				Type:       imessage.TapbackLove,
+			},
+		})
+		time.Sleep(25 * time.Millisecond)
+
+		portalC.Merge([]*Portal{portalB})
+		select {
+		case <-portalB.loopDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("portalB did not exit after merge into portalC")
+		}
+
+		// Give C a moment to observe B's forwarded tapback before releasing A.
+		time.Sleep(25 * time.Millisecond)
+		unpauseA()
+		select {
+		case <-portalA.loopDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("portalA did not exit after unpause")
+		}
+
+		var first, second sentMatrixEvt
+		select {
+		case first = <-sentEvts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for original event in C")
+		}
+		select {
+		case second = <-sentEvts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for between-merges tapback event in C")
+		}
+		if first.roomID != roomC || first.eventType != "m.room.message" {
+			t.Fatalf("expected m.room.message in %s first, got %+v", roomC, first)
+		}
+		if second.roomID != roomC || second.eventType != "m.reaction" || second.relTarget != "$evt-1" {
+			t.Fatalf("expected m.reaction targeting $evt-1 in %s second, got %+v", roomC, second)
+		}
+	})
+
 	t.Run("slow_drain_past_timeout", func(t *testing.T) {
 		origTimeout := portalBufferTimeout
 		portalBufferTimeout = 80 * time.Millisecond
