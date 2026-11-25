@@ -126,6 +126,7 @@ func (portal *Portal) reIDInto(newGUID string, newPortal *Portal, lock, mergeExi
 	if newPortal == portal {
 		return true
 	}
+	var replaceEmptyPortal *Portal
 	if newPortal != nil {
 		if mergeExisting && portal.MXID != "" && newPortal.MXID != "" && br.Config.Homeserver.Software == bridgeconfig.SoftwareHungry {
 			br.Log.Infofln("Got chat ID change %s->%s, but portal with new ID already exists. Merging portals in background", portal.GUID, newGUID)
@@ -133,7 +134,7 @@ func (portal *Portal) reIDInto(newGUID string, newPortal *Portal, lock, mergeExi
 			return false
 		} else if newPortal.MXID == "" && portal.MXID != "" {
 			br.Log.Infofln("Got chat ID change %s->%s. Portal with new ID already exists, but it doesn't have a room. Nuking new portal row before changing ID", portal.GUID, newGUID)
-			newPortal.unlockedDelete()
+			replaceEmptyPortal = newPortal
 		} else {
 			br.Log.Warnfln("Got chat ID change %s->%s, but portal with new ID already exists. Nuking old portal and not changing ID", portal.GUID, newGUID)
 			portal.unlockedDelete()
@@ -148,7 +149,29 @@ func (portal *Portal) reIDInto(newGUID string, newPortal *Portal, lock, mergeExi
 	portal.log.Infoln("Changing chat ID to", newGUID)
 	oldGUID := portal.GUID
 	oldService := portal.Identifier.Service
-	if err := portal.Portal.ReID(newGUID); err != nil {
+	if replaceEmptyPortal != nil {
+		txn, err := br.DB.Begin()
+		if err != nil {
+			portal.log.Warnfln("Aborting chat ID change %s->%s: failed to begin transaction: %v", oldGUID, newGUID, err)
+			return false
+		}
+		if err := replaceEmptyPortal.Portal.DeleteExec(txn); err != nil {
+			_ = txn.Rollback()
+			portal.log.Warnfln("Aborting chat ID change %s->%s: failed to delete empty target row: %v", oldGUID, newGUID, err)
+			return false
+		}
+		if err := portal.Portal.ReIDExec(txn, newGUID); err != nil {
+			_ = txn.Rollback()
+			portal.log.Warnfln("Aborting chat ID change %s->%s due to database error: %v", oldGUID, newGUID, err)
+			return false
+		}
+		if err := txn.Commit(); err != nil {
+			portal.GUID = oldGUID
+			portal.log.Warnfln("Aborting chat ID change %s->%s: failed to commit transaction: %v", oldGUID, newGUID, err)
+			return false
+		}
+		replaceEmptyPortal.unlockedRemoveFromCacheAndStop()
+	} else if err := portal.Portal.ReID(newGUID); err != nil {
 		portal.log.Warnfln("Aborting chat ID change %s->%s due to database error: %v", oldGUID, newGUID, err)
 		return false
 	}
@@ -375,6 +398,10 @@ type Portal struct {
 	stopOnce       sync.Once
 	loopDone       chan struct{}
 
+	handoffMu      sync.Mutex
+	handoffWaiters []<-chan struct{}
+	activeHandoffs atomic.Int32
+
 	roomCreateLock   sync.Mutex
 	messageDedup     map[string]SentMessage
 	messageDedupLock sync.Mutex
@@ -495,7 +522,7 @@ func (portal *Portal) stopLoopInto(target *Portal) {
 
 func (portal *Portal) resolveRedirectTarget() *Portal {
 	cur := portal.redirectTarget.Load()
-	for cur != nil {
+	for hops := 0; cur != nil && hops < 8; hops++ {
 		next := cur.redirectTarget.Load()
 		if next == nil || next == cur {
 			break
@@ -505,9 +532,77 @@ func (portal *Portal) resolveRedirectTarget() *Portal {
 	return cur
 }
 
+// registerHandoff records a retired portal's loopDone channel so new messages
+// routed to this survivor wait until the retired portal finishes forwarding its
+// buffered messages, preserving message/tapback ordering across a merge.
+func (portal *Portal) registerHandoff(done <-chan struct{}) {
+	if done == nil {
+		return
+	}
+	portal.handoffMu.Lock()
+	kept := portal.handoffWaiters[:0]
+	for _, ch := range portal.handoffWaiters {
+		select {
+		case <-ch:
+		default:
+			kept = append(kept, ch)
+		}
+	}
+	kept = append(kept, done)
+	portal.handoffWaiters = kept
+	portal.activeHandoffs.Store(int32(len(kept)))
+	portal.handoffMu.Unlock()
+}
+
+func (portal *Portal) waitForHandoffs(timeout time.Duration) (ready bool, stopped bool) {
+	if portal.activeHandoffs.Load() == 0 {
+		return true, false
+	}
+	portal.handoffMu.Lock()
+	waiters := append([]<-chan struct{}(nil), portal.handoffWaiters...)
+	portal.handoffMu.Unlock()
+	if len(waiters) == 0 {
+		return true, false
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for _, ch := range waiters {
+		select {
+		case <-ch:
+		case <-portal.stop:
+			return false, true
+		case <-timer.C:
+			return false, false
+		}
+	}
+
+	portal.handoffMu.Lock()
+	kept := portal.handoffWaiters[:0]
+	for _, ch := range portal.handoffWaiters {
+		select {
+		case <-ch:
+		default:
+			kept = append(kept, ch)
+		}
+	}
+	portal.handoffWaiters = kept
+	portal.activeHandoffs.Store(int32(len(kept)))
+	portal.handoffMu.Unlock()
+	return true, false
+}
+
 // enqueueMessage synchronizes admission to portal.Messages with handleMessageLoop
-// shutdown so no accepted send can occur after the loop's final drain.
+// shutdown and any in-progress merge handoffs so no accepted send can occur after
+// the loop's final drain and post-merge messages cannot overtake drained ones.
 func (portal *Portal) enqueueMessage(msg *imessage.Message, timeout time.Duration) (enqueued bool, stopped bool) {
+	if ok, st := portal.waitForHandoffs(timeout); !ok {
+		return false, st
+	}
+	return portal.enqueueMessageDirect(msg, timeout)
+}
+
+func (portal *Portal) enqueueMessageDirect(msg *imessage.Message, timeout time.Duration) (enqueued bool, stopped bool) {
 	portal.sendMu.RLock()
 	defer portal.sendMu.RUnlock()
 	if portal.stopped.Load() {
@@ -596,7 +691,7 @@ func (portal *Portal) handleDrainedMessage(msg *imessage.Message, target *Portal
 			target = resolved
 		}
 		if len(target.MXID) > 0 {
-			if ok, _ := target.enqueueMessage(msg, PortalBufferTimeout); ok {
+			if ok, _ := target.enqueueMessageDirect(msg, PortalBufferTimeout); ok {
 				return
 			}
 		}
@@ -2930,13 +3025,17 @@ func (portal *Portal) Delete() {
 
 func (portal *Portal) unlockedDelete() {
 	portal.Portal.Delete()
+	portal.unlockedRemoveFromCacheAndStop()
+}
+
+func (portal *Portal) unlockedRemoveFromCacheAndStop() {
 	delete(portal.bridge.portalsByGUID, portal.GUID)
 	for _, guid := range portal.SecondaryGUIDs {
 		if storedPortal := portal.bridge.portalsByGUID[guid]; storedPortal == portal {
 			delete(portal.bridge.portalsByGUID, guid)
 		}
 	}
-	if len(portal.MXID) > 0 {
+	if len(portal.MXID) > 0 && portal.bridge.portalsByMXID[portal.MXID] == portal {
 		delete(portal.bridge.portalsByMXID, portal.MXID)
 	}
 	portal.stopLoop()

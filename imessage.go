@@ -175,6 +175,10 @@ func (imh *iMessageHandler) getPortalFromMessage(msg *imessage.Message) *Portal 
 }
 
 func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
+	imh.handleMessage(msg, false)
+}
+
+func (imh *iMessageHandler) handleMessage(msg *imessage.Message, retried bool) {
 	imh.log.Debugfln("Received incoming message %s in %s (%s)", msg.GUID, msg.ChatGUID, msg.ThreadID)
 	// TODO trace log
 	//imh.log.Debugfln("Received incoming message: %+v", msg)
@@ -211,18 +215,24 @@ func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
 	if ok, stopped := portal.enqueueMessage(msg, PortalBufferTimeout); ok {
 		return
 	} else if stopped {
-		// Portal was merged or replaced while this message was in flight; try its
-		// redirect target or a live replacement portal for the same chat GUID once.
-		nextPortal := portal.resolveRedirectTarget()
-		if nextPortal == nil {
-			if fresh := imh.bridge.GetPortalByGUIDIfExists(msg.ChatGUID); fresh != nil && fresh != portal {
-				nextPortal = fresh
+		if target := portal.resolveRedirectTarget(); target != nil && target != portal {
+			if len(target.MXID) == 0 {
+				if err := target.CreateMatrixRoom(nil, nil); err != nil {
+					imh.log.Warnfln("Failed to create Matrix room for redirect target %s: %v", target.GUID, err)
+					msg.CleanupTempAttachments()
+					imh.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, "", false)
+					return
+				}
 			}
-		}
-		if nextPortal != nil && nextPortal != portal && len(nextPortal.MXID) > 0 {
-			if ok2, _ := nextPortal.enqueueMessage(msg, PortalBufferTimeout); ok2 {
+			if ok2, _ := target.enqueueMessage(msg, PortalBufferTimeout); ok2 {
 				return
 			}
+		} else if !retried {
+			// Portal was deleted or replaced without an explicit merge redirect;
+			// retry full routing and room creation once so in-flight messages
+			// aren't dropped or misrouted.
+			imh.handleMessage(msg, true)
+			return
 		}
 		imh.log.Debugfln("Portal %s stopped before message %s could be queued", portal.GUID, msg.GUID)
 		msg.CleanupTempAttachments()
@@ -235,6 +245,10 @@ func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
 }
 
 func (imh *iMessageHandler) HandleMessageStatus(status *imessage.SendMessageStatus) {
+	imh.handleMessageStatus(status, false)
+}
+
+func (imh *iMessageHandler) handleMessageStatus(status *imessage.SendMessageStatus, retried bool) {
 	portal := imh.bridge.GetPortalByGUID(status.ChatGUID)
 	if len(portal.MXID) == 0 {
 		imh.log.Debugfln("Ignoring message status for message from unknown portal %s/%s", status.GUID, status.ChatGUID)
@@ -243,14 +257,10 @@ func (imh *iMessageHandler) HandleMessageStatus(status *imessage.SendMessageStat
 	if ok, stopped := portal.enqueueMessageStatus(status, PortalBufferTimeout); ok {
 		return
 	} else if stopped {
-		nextPortal := portal.resolveRedirectTarget()
-		if nextPortal == nil {
-			if fresh := imh.bridge.GetPortalByGUIDIfExists(status.ChatGUID); fresh != nil && fresh != portal {
-				nextPortal = fresh
-			}
-		}
-		if nextPortal != nil && nextPortal != portal && len(nextPortal.MXID) > 0 {
-			_, _ = nextPortal.enqueueMessageStatus(status, PortalBufferTimeout)
+		if target := portal.resolveRedirectTarget(); target != nil && target != portal && len(target.MXID) > 0 {
+			_, _ = target.enqueueMessageStatus(status, PortalBufferTimeout)
+		} else if !retried {
+			imh.handleMessageStatus(status, true)
 		}
 		return
 	}
@@ -258,6 +268,10 @@ func (imh *iMessageHandler) HandleMessageStatus(status *imessage.SendMessageStat
 }
 
 func (imh *iMessageHandler) HandleReadReceipt(rr *imessage.ReadReceipt) {
+	imh.handleReadReceipt(rr, false)
+}
+
+func (imh *iMessageHandler) handleReadReceipt(rr *imessage.ReadReceipt, retried bool) {
 	portal := imh.bridge.GetPortalByGUID(rr.ChatGUID)
 	if len(portal.MXID) == 0 {
 		imh.log.Debugfln("Ignoring read receipt in unknown portal %s", rr.ChatGUID)
@@ -266,14 +280,10 @@ func (imh *iMessageHandler) HandleReadReceipt(rr *imessage.ReadReceipt) {
 	if ok, stopped := portal.enqueueReadReceipt(rr, PortalBufferTimeout); ok {
 		return
 	} else if stopped {
-		nextPortal := portal.resolveRedirectTarget()
-		if nextPortal == nil {
-			if fresh := imh.bridge.GetPortalByGUIDIfExists(rr.ChatGUID); fresh != nil && fresh != portal {
-				nextPortal = fresh
-			}
-		}
-		if nextPortal != nil && nextPortal != portal && len(nextPortal.MXID) > 0 {
-			_, _ = nextPortal.enqueueReadReceipt(rr, PortalBufferTimeout)
+		if target := portal.resolveRedirectTarget(); target != nil && target != portal && len(target.MXID) > 0 {
+			_, _ = target.enqueueReadReceipt(rr, PortalBufferTimeout)
+		} else if !retried {
+			imh.handleReadReceipt(rr, true)
 		}
 		return
 	}

@@ -170,6 +170,9 @@ func (portal *Portal) Merge(others []*Portal) {
 				if len(other.MXID) > 0 && portal.bridge.portalsByMXID[other.MXID] == other {
 					delete(portal.bridge.portalsByMXID, other.MXID)
 				}
+				// Register handoff before releasing portalsLock so new messages routed
+				// to portal wait for other's buffered messages to be forwarded first.
+				portal.registerHandoff(other.loopDone)
 				other.stopLoopInto(portal)
 			}
 		}

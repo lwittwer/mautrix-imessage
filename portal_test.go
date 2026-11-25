@@ -1196,6 +1196,23 @@ func (r *recordingBridgeResultIMAPI) SendMessageBridgeResult(chatID, messageID s
 	r.mu.Unlock()
 }
 
+func pausePortalLoop(t *testing.T, portal *Portal) func() {
+	t.Helper()
+	portal.backfillLock.Lock()
+	portal.backfillWait.Add(1)
+	select {
+	case portal.backfillStart <- struct{}{}:
+	case <-time.After(2 * time.Second):
+		portal.backfillWait.Done()
+		portal.backfillLock.Unlock()
+		t.Fatal("timed out waiting for handleMessageLoop to acknowledge pause")
+	}
+	return func() {
+		portal.backfillWait.Done()
+		portal.backfillLock.Unlock()
+	}
+}
+
 func TestEnqueueSynchronizedWithShutdownNoStrandedMessages(t *testing.T) {
 	rawDB, err := dbutil.NewWithDialect("file:enqueue_shutdown_sync_test?mode=memory&cache=shared&_foreign_keys=on", "sqlite3")
 	if err != nil {
@@ -1221,8 +1238,8 @@ func TestEnqueueSynchronizedWithShutdownNoStrandedMessages(t *testing.T) {
 	br.ZLog = &zlog
 
 	portal := br.GetPortalByGUID("iMessage;-;+15554000001")
-	// Pause the message loop so queued messages remain buffered until shutdown drains them.
-	portal.lockBackfill()
+	// Pause the message loop deterministically so queued messages remain buffered until shutdown drains them.
+	unpause := pausePortalLoop(t, portal)
 
 	tmpDir := t.TempDir()
 	const totalSenders = 40
@@ -1265,7 +1282,7 @@ func TestEnqueueSynchronizedWithShutdownNoStrandedMessages(t *testing.T) {
 
 	close(start)
 	portal.stopLoop()
-	portal.unlockBackfill()
+	unpause()
 	<-portal.loopDone
 	wg.Wait()
 
@@ -1384,8 +1401,8 @@ func TestDrainedEditClearsBlueBubblesInflightState(t *testing.T) {
 	<-ready
 
 	portal := br.GetPortalByGUID("iMessage;-;+15554000002")
-	// Pause handleMessageLoop so the queued edit is discarded by the drain on stop.
-	portal.lockBackfill()
+	// Pause handleMessageLoop deterministically so the queued edit is discarded by the drain on stop.
+	unpause := pausePortalLoop(t, portal)
 
 	baseMs := time.Now().Add(-time.Minute).UnixMilli()
 	editFrame := fmt.Sprintf(`42["updated-message",{"guid":"edit-drain-1","isFromMe":true,"text":"edited text","dateCreated":%d,"dateEdited":%d,"chats":[{"guid":"iMessage;-;+15554000002"}]}]`, baseMs, baseMs+5000)
@@ -1405,7 +1422,7 @@ func TestDrainedEditClearsBlueBubblesInflightState(t *testing.T) {
 	// Stop the portal and release backfillWait so the drain discards firstEdit and
 	// reports SendMessageBridgeResult(..., false) back to BlueBubbles.
 	portal.Delete()
-	portal.unlockBackfill()
+	unpause()
 	select {
 	case <-portal.loopDone:
 	case <-time.After(time.Second):
@@ -1472,6 +1489,29 @@ func TestReIDIntoFailurePreservesSurvivingPortalLookup(t *testing.T) {
 	// Fresh DB lookup (simulating restart) MUST still resolve the surviving portal via merged_chat!
 	if row := db.Portal.GetByGUID("iMessage;-;+15555000001"); row == nil || row.GUID != "iMessage;-;+15555000001" {
 		t.Fatalf("expected fresh DB lookup for surviving portal to succeed after failed ReID, got %+v", row)
+	}
+
+	// Also verify atomic rollback when replacing an empty target portal fails on DB UPDATE.
+	srcRow := db.Portal.New()
+	srcRow.GUID = "iMessage;-;+15555000002"
+	srcRow.MXID = "!src-room:example.com"
+	srcRow.Insert(nil)
+	srcPortal := br.GetPortalByGUID("iMessage;-;+15555000002")
+	defer srcPortal.stopLoop()
+
+	emptyTarget := br.GetPortalByGUID("SMS;-;+15555000002")
+	defer emptyTarget.stopLoop()
+
+	if br.ReIDPortal("iMessage;-;+15555000002", "SMS;-;+15555000002", false) {
+		t.Fatal("expected ReIDPortal replacing empty target to return false when DB update fails")
+	}
+	if row := db.Portal.GetByGUID("SMS;-;+15555000002"); row == nil {
+		t.Fatal("expected empty target portal row to survive via rollback when DB ReID fails")
+	}
+	select {
+	case <-emptyTarget.loopDone:
+		t.Fatal("expected empty target portal loop to remain running when DB ReID fails")
+	default:
 	}
 }
 
@@ -1577,8 +1617,9 @@ func TestMergeTwoRoomFallbackEvictsRetiredMXIDAndForwardsQueuedMessages(t *testi
 	defer survivor.stopLoop()
 	retired := br.GetPortalByGUID(retRow.GUID)
 
-	// Buffer a message on retired while its loop is paused so it is still queued during Merge.
-	retired.lockBackfill()
+	// Buffer a message on retired while its loop is deterministically paused so it is guaranteed
+	// to be buffered at merge time even under GOMAXPROCS=1.
+	unpauseRetired := pausePortalLoop(t, retired)
 	queuedMsg := &imessage.Message{
 		GUID:     "queued-during-merge-1",
 		ChatGUID: retired.GUID,
@@ -1592,7 +1633,7 @@ func TestMergeTwoRoomFallbackEvictsRetiredMXIDAndForwardsQueuedMessages(t *testi
 	}
 
 	survivor.Merge([]*Portal{retired})
-	retired.unlockBackfill()
+	unpauseRetired()
 
 	select {
 	case <-retired.loopDone:
@@ -1619,5 +1660,193 @@ func TestMergeTwoRoomFallbackEvictsRetiredMXIDAndForwardsQueuedMessages(t *testi
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for merged portal to deliver message buffered on retired portal")
+	}
+}
+
+func TestMergePreservesTargetBeforeTapbackOrdering(t *testing.T) {
+	rawDB, err := dbutil.NewWithDialect("file:merge_tapback_order_test?mode=memory&cache=shared&_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	defer rawDB.Close()
+
+	db := database.New(rawDB, log.DefaultLogger)
+	if err := db.Upgrade(); err != nil {
+		t.Fatalf("database upgrade failed: %v", err)
+	}
+
+	type sentMatrixEvt struct {
+		roomID    id.RoomID
+		eventType string
+		relTarget id.EventID
+	}
+	sentEvts := make(chan sentMatrixEvt, 8)
+	var evtSeq atomic.Int32
+	mxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/send/") {
+			parts := strings.Split(r.URL.Path, "/")
+			var roomID id.RoomID
+			var evType string
+			for i, p := range parts {
+				if p == "rooms" && i+1 < len(parts) {
+					roomID = id.RoomID(parts[i+1])
+				}
+				if p == "send" && i+1 < len(parts) {
+					evType = parts[i+1]
+				}
+			}
+			var body struct {
+				RelatesTo struct {
+					EventID id.EventID `json:"event_id"`
+				} `json:"m.relates_to"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			eid := id.EventID(fmt.Sprintf("$evt-%d", evtSeq.Add(1)))
+			sentEvts <- sentMatrixEvt{
+				roomID:    roomID,
+				eventType: evType,
+				relTarget: body.RelatesTo.EventID,
+			}
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"event_id":%q}`, eid)))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer mxSrv.Close()
+
+	makeIntent := func(mxid id.UserID, rooms ...id.RoomID) *appservice.IntentAPI {
+		as := appservice.Create()
+		as.HomeserverDomain = "example.com"
+		as.Registration = &appservice.Registration{AppToken: "token"}
+		client, err := mautrix.NewClient(mxSrv.URL, mxid, "token")
+		if err != nil {
+			t.Fatal(err)
+		}
+		intent := as.NewIntentAPI(mxid.Localpart())
+		intent.Client = client
+		intent.UserID = mxid
+		intent.IsCustomPuppet = true
+		as.StateStore.MarkRegistered(mxid)
+		for _, room := range rooms {
+			as.StateStore.SetMembership(room, mxid, event.MembershipJoin)
+		}
+		return intent
+	}
+
+	survivorRoom := id.RoomID("!surv-order:example.com")
+	retiredRoom := id.RoomID("!ret-order:example.com")
+
+	zlog := zerolog.Nop()
+	br := &IMBridge{
+		DB: db,
+		Config: &config.Config{
+			BaseConfig: &bridgeconfig.BaseConfig{
+				Homeserver: bridgeconfig.HomeserverConfig{Software: bridgeconfig.SoftwareStandard},
+			},
+		},
+		portalsByGUID: make(map[string]*Portal),
+		portalsByMXID: make(map[id.RoomID]*Portal),
+		puppets:       make(map[string]*Puppet),
+		user:          &User{User: &database.User{MXID: "@me:example.com"}},
+		IM:            &fakeTestIMAPI{},
+	}
+	br.Log = log.DefaultLogger
+	br.ZLog = &zlog
+	br.SpecVersions = mautrix.RespVersions{}
+	br.Bot = makeIntent("@bot:example.com", survivorRoom, retiredRoom)
+	br.puppets["+15557000001"] = &Puppet{
+		Puppet: &database.Puppet{ID: "+15557000001", Displayname: "Alice"},
+		bridge: br,
+		MXID:   "@imessage_15557000001:example.com",
+		Intent: makeIntent("@imessage_15557000001:example.com", survivorRoom, retiredRoom),
+	}
+	br.puppets["alice2@example.com"] = &Puppet{
+		Puppet: &database.Puppet{ID: "alice2@example.com", Displayname: "Alice"},
+		bridge: br,
+		MXID:   "@imessage_alice2:example.com",
+		Intent: makeIntent("@imessage_alice2:example.com", survivorRoom, retiredRoom),
+	}
+	imh := NewiMessageHandler(br)
+
+	survRow := db.Portal.New()
+	survRow.GUID = "iMessage;-;+15557000001"
+	survRow.MXID = survivorRoom
+	survRow.Insert(nil)
+
+	retRow := db.Portal.New()
+	retRow.GUID = "iMessage;-;alice2@example.com"
+	retRow.MXID = retiredRoom
+	retRow.Insert(nil)
+
+	survivor := br.GetPortalByGUID(survRow.GUID)
+	defer survivor.stopLoop()
+	retired := br.GetPortalByGUID(retRow.GUID)
+
+	// Hold the original message buffered on retired while Merge switches GUID routing.
+	unpauseRetired := pausePortalLoop(t, retired)
+	origMsg := &imessage.Message{
+		GUID:     "orig-target-1",
+		ChatGUID: retired.GUID,
+		Sender:   imessage.Identifier{LocalID: "+15557000001", Service: "iMessage"},
+		Service:  "iMessage",
+		Text:     "original message",
+		Time:     time.Now(),
+	}
+	if ok, _ := retired.enqueueMessage(origMsg, time.Second); !ok {
+		t.Fatal("failed to queue original message on retired portal")
+	}
+
+	survivor.Merge([]*Portal{retired})
+
+	// Submit a tapback for orig-target-1 via the updated route BEFORE retired finishes draining.
+	tapbackDone := make(chan struct{})
+	go func() {
+		defer close(tapbackDone)
+		imh.HandleMessage(&imessage.Message{
+			GUID:     "tapback-on-orig-1",
+			ChatGUID: retired.GUID,
+			Sender:   imessage.Identifier{LocalID: "+15557000001", Service: "iMessage"},
+			Service:  "iMessage",
+			Time:     time.Now(),
+			Tapback: &imessage.Tapback{
+				TargetGUID: "orig-target-1",
+				TargetPart: 0,
+				Type:       imessage.TapbackLove,
+			},
+		})
+	}()
+
+	// Give the tapback goroutine time to reach survivor.waitForHandoffs before unpausing retired.
+	time.Sleep(30 * time.Millisecond)
+	unpauseRetired()
+
+	select {
+	case <-retired.loopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retired portal did not exit after Merge")
+	}
+	select {
+	case <-tapbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleMessage for tapback did not complete after handoff")
+	}
+
+	// Matrix MUST receive m.room.message FIRST, followed by m.reaction targeting its event ID.
+	var first, second sentMatrixEvt
+	select {
+	case first = <-sentEvts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first Matrix event")
+	}
+	select {
+	case second = <-sentEvts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for second Matrix event (tapback)")
+	}
+	if first.roomID != survivorRoom || first.eventType != "m.room.message" {
+		t.Fatalf("expected first event to be m.room.message in %s, got %+v", survivorRoom, first)
+	}
+	if second.roomID != survivorRoom || second.eventType != "m.reaction" || second.relTarget != "$evt-1" {
+		t.Fatalf("expected second event to be m.reaction targeting $evt-1 in %s, got %+v", survivorRoom, second)
 	}
 }

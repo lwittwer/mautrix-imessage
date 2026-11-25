@@ -1112,6 +1112,10 @@ func (bb *blueBubbles) catchUpChat(chat Chat, since, editLookback time.Time) (in
 		if raw.DateEdited != 0 {
 			if bb.consumePendingEdit(raw.GUID, raw.Text) {
 				bb.markEdited(raw.GUID, raw.DateEdited)
+			} else if raw.DateEdited >= sinceMs {
+				// Inside the explicit reconnect disconnect window: allow recovering unseen
+				// edits even when the disconnect lasted longer than editKVTTL.
+				isNewEdit = bb.isUnseenEdit(raw.GUID, raw.DateEdited)
 			} else {
 				isNewEdit = bb.isNewEdit(raw.GUID, raw.DateEdited)
 			}
@@ -1214,14 +1218,21 @@ func (bb *blueBubbles) isNewEdit(guid string, dateEdited int64) bool {
 	if guid == "" || dateEdited == 0 {
 		return false
 	}
-	// Ignore edits older than the persisted edit KV TTL so read/delivery updates
-	// on historical edited messages whose bb_edit: row was pruned do not re-bridge
-	// duplicate edits to Matrix.
+	// Ignore edits older than the persisted edit KV TTL on unsolicited updates so
+	// read/delivery updates on historical edited messages whose bb_edit: row was
+	// pruned do not re-bridge duplicate edits to Matrix.
 	ttl := bb.editKVTTL
 	if ttl <= 0 {
 		ttl = defaultEditKVTTL
 	}
 	if dateEdited < time.Now().Add(-ttl).UnixMilli() {
+		return false
+	}
+	return bb.isUnseenEdit(guid, dateEdited)
+}
+
+func (bb *blueBubbles) isUnseenEdit(guid string, dateEdited int64) bool {
+	if guid == "" || dateEdited == 0 {
 		return false
 	}
 	bb.editedLock.Lock()

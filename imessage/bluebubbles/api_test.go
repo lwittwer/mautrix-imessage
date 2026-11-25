@@ -2494,3 +2494,78 @@ func TestEditKVCleanupPrunesExpiredEntries(t *testing.T) {
 		t.Fatal("expected read receipt on pruned edited message to still be forwarded")
 	}
 }
+
+func TestReconnectCatchUpRecoversEditDuring31DayDisconnect(t *testing.T) {
+	now := time.Now()
+	since := now.Add(-31 * 24 * time.Hour)
+	editLookback := since.Add(-defaultEditRetractLookback)
+	createdMs := since.Add(-5 * time.Minute).UnixMilli()
+	editedMs := since.Add(1 * time.Minute).UnixMilli()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/chat/iMessage;-;+15558889999/message" {
+			_ = json.NewEncoder(w).Encode(MessageQueryResponse{
+				Status: 200,
+				Data: []Message{
+					{
+						GUID:        "msg-31d-edit",
+						DateCreated: createdMs,
+						DateEdited:  editedMs,
+						Text:        "edited during 31-day outage",
+						Handle:      Handle{Address: "+15558889999", Service: "iMessage"},
+						Chats:       []Chat{{GUID: "iMessage;-;+15558889999"}},
+					},
+				},
+				Metadata: PageMetadata{Total: 1, Limit: 100, Offset: 0, Count: 1},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+	chat := Chat{
+		GUID: "iMessage;-;+15558889999",
+		LastMessage: &Message{
+			GUID:        "msg-31d-edit",
+			DateCreated: createdMs,
+			DateEdited:  editedMs,
+			Text:        "edited during 31-day outage",
+		},
+	}
+
+	enqueued, err := bb.catchUpChat(chat, since, editLookback)
+	if err != nil {
+		t.Fatalf("catchUpChat failed: %v", err)
+	}
+	if enqueued != 1 {
+		t.Fatalf("expected 1 edit recovered during 31-day disconnect catch-up, got %d", enqueued)
+	}
+	select {
+	case msg := <-bb.MessageChan():
+		if msg.GUID != "msg-31d-edit" || !msg.IsEdited || msg.Text != "edited during 31-day outage" {
+			t.Fatalf("unexpected recovered edit: %+v", msg)
+		}
+	default:
+		t.Fatal("expected recovered 31-day disconnect edit on MessageChan")
+	}
+
+	// Unsolicited updated-message for a different 31-day-old edit MUST still be blocked by editKVTTL.
+	unsolicitedOld := json.RawMessage(fmt.Sprintf(`{
+		"guid": "msg-31d-unsolicited",
+		"isFromMe": true,
+		"text": "stale unsolicited edit",
+		"dateCreated": %d,
+		"dateEdited": %d,
+		"chats": [{"guid": "iMessage;-;+15558889999"}]
+	}`, createdMs, editedMs))
+	if err := bb.handleMessageUpdated(unsolicitedOld); err != nil {
+		t.Fatalf("handleMessageUpdated failed: %v", err)
+	}
+	select {
+	case dup := <-bb.MessageChan():
+		t.Fatalf("expected unsolicited 31-day-old edit to be rejected by TTL guard, got %+v", dup)
+	default:
+	}
+}
