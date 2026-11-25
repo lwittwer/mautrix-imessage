@@ -41,6 +41,7 @@ func DoUpgrade(helper *up.Helper) {
 	helper.Copy(up.Bool, "imessage", "delete_media_after_upload")
 	helper.Copy(up.Str|up.Null, "imessage", "bluebubbles_url")
 	helper.Copy(up.Str|up.Null, "imessage", "bluebubbles_password")
+	helper.Copy(up.Bool, "imessage", "bluebubbles_custom_emoji_reactions")
 
 	helper.Copy(up.Str|up.Null, "segment", "key")
 	helper.Copy(up.Str|up.Null, "segment", "user_id")

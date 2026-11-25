@@ -165,12 +165,22 @@ func (portal *Portal) Merge(others []*Portal) {
 	if err != nil {
 		portal.log.Errorln("Failed to commit room merge transaction:", err)
 	} else {
+		for _, other := range others {
+			if other != nil && other != portal {
+				if len(other.MXID) > 0 && portal.bridge.portalsByMXID[other.MXID] == other {
+					delete(portal.bridge.portalsByMXID, other.MXID)
+				}
+				other.stopLoopInto(portal)
+			}
+		}
 		portal.log.Infofln("Finished merging %v -> %s / %v -> %s", guids, portal.GUID, roomIDs, newRoomID)
 		if newRoomID != "" {
 			portal.addToSpace(portal.bridge.user)
 			portal.bridge.user.UpdateDirectChats(map[id.UserID][]id.RoomID{portal.GetDMPuppet().MXID: {portal.MXID}})
-			for _, user := range req.NewRoom.Invite {
-				portal.bridge.StateStore.SetMembership(portal.MXID, user, event.MembershipJoin)
+			if req != nil {
+				for _, user := range req.NewRoom.Invite {
+					portal.bridge.StateStore.SetMembership(portal.MXID, user, event.MembershipJoin)
+				}
 			}
 		}
 	}

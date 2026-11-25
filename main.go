@@ -277,6 +277,13 @@ func (br *IMBridge) DeleteKV(key string) {
 	br.DB.KV.Delete(key)
 }
 
+func (br *IMBridge) DeleteKVPrefixOlderThan(prefix string, cutoff int64) (int64, error) {
+	if br == nil || br.DB == nil || br.DB.KV == nil {
+		return 0, nil
+	}
+	return br.DB.KV.DeletePrefixOlderThan(prefix, cutoff)
+}
+
 func (br *IMBridge) IsCaptionInMessage() bool {
 	if br == nil || br.Config == nil {
 		return false

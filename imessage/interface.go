@@ -78,6 +78,7 @@ type KVStore interface {
 	GetKV(key string) string
 	SetKV(key, value string)
 	DeleteKV(key string)
+	DeleteKVPrefixOlderThan(prefix string, cutoff int64) (int64, error)
 }
 
 type CaptionConfig interface {
@@ -184,8 +185,9 @@ type PlatformConfig struct {
 
 	DeleteMediaAfterUpload bool `yaml:"delete_media_after_upload"`
 
-	BlueBubblesURL      string `yaml:"bluebubbles_url"`
-	BlueBubblesPassword string `yaml:"bluebubbles_password"`
+	BlueBubblesURL                  string `yaml:"bluebubbles_url"`
+	BlueBubblesPassword             string `yaml:"bluebubbles_password"`
+	BlueBubblesCustomEmojiReactions bool   `yaml:"bluebubbles_custom_emoji_reactions"`
 }
 
 func (pc *PlatformConfig) BridgeName() string {

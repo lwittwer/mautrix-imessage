@@ -89,6 +89,10 @@ imessage:
 
     bluebubbles_url:
     bluebubbles_password:
+    # Enable outbound custom emoji reactions for BlueBubbles servers/forks whose
+    # /api/v1/message/react validator accepts custom emoji (upstream currently only
+    # accepts the 6 classic tapback names). Inbound custom emoji reactions are always active.
+    bluebubbles_custom_emoji_reactions: false
 
 # Segment settings for collecting some debug data.
 segment:

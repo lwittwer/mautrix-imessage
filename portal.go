@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gabriel-vasile/mimetype"
@@ -125,6 +126,7 @@ func (portal *Portal) reIDInto(newGUID string, newPortal *Portal, lock, mergeExi
 	if newPortal == portal {
 		return true
 	}
+	var replaceEmptyPortal *Portal
 	if newPortal != nil {
 		if mergeExisting && portal.MXID != "" && newPortal.MXID != "" && br.Config.Homeserver.Software == bridgeconfig.SoftwareHungry {
 			br.Log.Infofln("Got chat ID change %s->%s, but portal with new ID already exists. Merging portals in background", portal.GUID, newGUID)
@@ -132,9 +134,10 @@ func (portal *Portal) reIDInto(newGUID string, newPortal *Portal, lock, mergeExi
 			return false
 		} else if newPortal.MXID == "" && portal.MXID != "" {
 			br.Log.Infofln("Got chat ID change %s->%s. Portal with new ID already exists, but it doesn't have a room. Nuking new portal row before changing ID", portal.GUID, newGUID)
-			newPortal.unlockedDelete()
+			replaceEmptyPortal = newPortal
 		} else {
 			br.Log.Warnfln("Got chat ID change %s->%s, but portal with new ID already exists. Nuking old portal and not changing ID", portal.GUID, newGUID)
+			portal.stopLoopInto(newPortal)
 			portal.unlockedDelete()
 			if len(portal.MXID) > 0 && portal.bridge.user.DoublePuppetIntent != nil {
 				_, _ = portal.bridge.user.DoublePuppetIntent.LeaveRoom(portal.MXID)
@@ -147,17 +150,56 @@ func (portal *Portal) reIDInto(newGUID string, newPortal *Portal, lock, mergeExi
 	portal.log.Infoln("Changing chat ID to", newGUID)
 	oldGUID := portal.GUID
 	oldService := portal.Identifier.Service
+	if replaceEmptyPortal != nil {
+		txn, err := br.DB.Begin()
+		if err != nil {
+			portal.log.Warnfln("Aborting chat ID change %s->%s: failed to begin transaction: %v", oldGUID, newGUID, err)
+			return false
+		}
+		if err := replaceEmptyPortal.Portal.DeleteExec(txn); err != nil {
+			_ = txn.Rollback()
+			portal.log.Warnfln("Aborting chat ID change %s->%s: failed to delete empty target row: %v", oldGUID, newGUID, err)
+			return false
+		}
+		if err := portal.Portal.ReIDExec(txn, newGUID); err != nil {
+			_ = txn.Rollback()
+			portal.log.Warnfln("Aborting chat ID change %s->%s due to database error: %v", oldGUID, newGUID, err)
+			return false
+		}
+		if err := txn.Commit(); err != nil {
+			portal.GUID = oldGUID
+			portal.log.Warnfln("Aborting chat ID change %s->%s: failed to commit transaction: %v", oldGUID, newGUID, err)
+			return false
+		}
+		replaceEmptyPortal.unlockedRemoveFromCacheAndStop()
+	} else if err := portal.Portal.ReID(newGUID); err != nil {
+		portal.log.Warnfln("Aborting chat ID change %s->%s due to database error: %v", oldGUID, newGUID, err)
+		return false
+	}
 	delete(br.portalsByGUID, oldGUID)
-	portal.Portal.ReID(newGUID)
 	portal.Identifier = imessage.ParseIdentifier(portal.GUID)
 	portal.log = portal.bridge.Log.Sub(fmt.Sprintf("Portal/%s", portal.GUID))
 	br.portalsByGUID[portal.GUID] = portal
 	if portal.IsPrivateChat() {
+		// Scope old-GUID aliasing to Sequoia "any;-;" migrations so legacy mac/iOS
+		// ReIDPortal and DisableSMSPortals toggles don't leave stale aliases behind,
+		// while still maintaining the new GUID's self-mapping row in merged_chat.
+		keepOldAlias := portal.Identifier.Service == "any"
 		if br.DB != nil && br.DB.MergedChat != nil {
-			br.DB.MergedChat.Set(nil, portal.GUID, portal.GUID, oldGUID)
+			if keepOldAlias {
+				br.DB.MergedChat.Set(nil, portal.GUID, portal.GUID, oldGUID)
+			} else {
+				br.DB.MergedChat.Set(nil, portal.GUID, portal.GUID)
+				br.DB.MergedChat.Remove(oldGUID)
+			}
 		}
-		br.portalsByGUID[oldGUID] = portal
-		portal.addSecondaryGUIDs([]string{oldGUID})
+		if keepOldAlias {
+			br.portalsByGUID[oldGUID] = portal
+			portal.addSecondaryGUIDs([]string{portal.GUID, oldGUID})
+		} else {
+			portal.removeSecondaryGUID(oldGUID)
+			portal.addSecondaryGUIDs([]string{portal.GUID})
+		}
 	}
 	if portal.Identifier.Service == "any" && oldService != "" && oldService != "any" {
 		portal.serviceLock.Lock()
@@ -307,6 +349,8 @@ func (br *IMBridge) NewPortal(dbPortal *database.Portal) *Portal {
 		MessageStatuses: make(chan *imessage.SendMessageStatus, 100),
 		MatrixMessages:  make(chan *event.Event, 100),
 		backfillStart:   make(chan struct{}),
+		stop:            make(chan struct{}),
+		loopDone:        make(chan struct{}),
 	}
 	portal.log = maulogadapt.ZeroAsMau(&portal.zlog)
 	if portal.Identifier.Service == "any" && br.DB != nil && br.DB.KV != nil {
@@ -347,6 +391,13 @@ type Portal struct {
 	backfillStart   chan struct{}
 	backfillWait    sync.WaitGroup
 	backfillLock    sync.Mutex
+
+	sendMu         sync.RWMutex
+	stopped        atomic.Bool
+	redirectTarget atomic.Pointer[Portal]
+	stop           chan struct{}
+	stopOnce       sync.Once
+	loopDone       chan struct{}
 
 	roomCreateLock   sync.Mutex
 	messageDedup     map[string]SentMessage
@@ -445,7 +496,165 @@ func (portal *Portal) MarkEncrypted() {
 }
 
 func (portal *Portal) ReceiveMatrixEvent(_ bridge.User, evt *event.Event) {
-	portal.MatrixMessages <- evt
+	if !portal.enqueueMatrixEvent(evt) {
+		portal.log.Debugfln("Dropping Matrix event %s for stopped portal", evt.ID)
+	}
+}
+
+func (portal *Portal) stopLoop() {
+	portal.stopLoopInto(nil)
+}
+
+// stopLoopInto stops handleMessageLoop and forwards any buffered messages to
+// target.Messages. Ordering across a concurrent merge or re-ID is best-effort,
+// matching the pre-existing concurrent-loop behavior on master.
+func (portal *Portal) stopLoopInto(target *Portal) {
+	portal.stopOnce.Do(func() {
+		if target != nil && target != portal {
+			portal.redirectTarget.Store(target)
+		}
+		portal.stopped.Store(true)
+		if portal.stop != nil {
+			close(portal.stop)
+		}
+	})
+}
+
+func (portal *Portal) resolveRedirectTarget() *Portal {
+	cur := portal.redirectTarget.Load()
+	for hops := 0; cur != nil && hops < 8; hops++ {
+		next := cur.redirectTarget.Load()
+		if next == nil || next == cur {
+			break
+		}
+		cur = next
+	}
+	return cur
+}
+
+// enqueueMessage synchronizes admission to portal.Messages with handleMessageLoop
+// shutdown so no accepted send can occur after the loop's final drain.
+func (portal *Portal) enqueueMessage(msg *imessage.Message, timeout time.Duration) (enqueued bool, stopped bool) {
+	portal.sendMu.RLock()
+	defer portal.sendMu.RUnlock()
+	if portal.stopped.Load() {
+		return false, true
+	}
+	select {
+	case portal.Messages <- msg:
+		return true, false
+	default:
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-portal.stop:
+		return false, true
+	case portal.Messages <- msg:
+		return true, false
+	case <-timer.C:
+		return false, false
+	}
+}
+
+func (portal *Portal) enqueueMessageStatus(status *imessage.SendMessageStatus, timeout time.Duration) (enqueued bool, stopped bool) {
+	portal.sendMu.RLock()
+	defer portal.sendMu.RUnlock()
+	if portal.stopped.Load() {
+		return false, true
+	}
+	select {
+	case portal.MessageStatuses <- status:
+		return true, false
+	default:
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-portal.stop:
+		return false, true
+	case portal.MessageStatuses <- status:
+		return true, false
+	case <-timer.C:
+		return false, false
+	}
+}
+
+func (portal *Portal) enqueueReadReceipt(rr *imessage.ReadReceipt, timeout time.Duration) (enqueued bool, stopped bool) {
+	portal.sendMu.RLock()
+	defer portal.sendMu.RUnlock()
+	if portal.stopped.Load() {
+		return false, true
+	}
+	select {
+	case portal.ReadReceipts <- rr:
+		return true, false
+	default:
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-portal.stop:
+		return false, true
+	case portal.ReadReceipts <- rr:
+		return true, false
+	case <-timer.C:
+		return false, false
+	}
+}
+
+func (portal *Portal) enqueueMatrixEvent(evt *event.Event) bool {
+	portal.sendMu.RLock()
+	defer portal.sendMu.RUnlock()
+	if portal.stopped.Load() {
+		return false
+	}
+	select {
+	case portal.MatrixMessages <- evt:
+		return true
+	case <-portal.stop:
+		return false
+	}
+}
+
+func (portal *Portal) handleDrainedMessage(msg *imessage.Message, target *Portal) {
+	if msg == nil {
+		return
+	}
+	for hops := 0; target != nil && hops < 8; hops++ {
+		if resolved := target.resolveRedirectTarget(); resolved != nil {
+			target = resolved
+		}
+		if len(target.MXID) == 0 {
+			break
+		}
+		ok, stopped := target.enqueueMessage(msg, PortalBufferTimeout)
+		if ok {
+			return
+		}
+		if !stopped {
+			break
+		}
+		next := target.resolveRedirectTarget()
+		if next == nil || next == target {
+			break
+		}
+		target = next
+	}
+	msg.CleanupTempAttachments()
+	if portal.bridge != nil && portal.bridge.IM != nil {
+		portal.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, "", false)
+	}
+}
+
+func (portal *Portal) removeSecondaryGUID(target string) {
+	filtered := portal.SecondaryGUIDs[:0]
+	for _, guid := range portal.SecondaryGUIDs {
+		if guid != target {
+			filtered = append(filtered, guid)
+		}
+	}
+	portal.SecondaryGUIDs = filtered
 }
 
 func (portal *Portal) addSecondaryGUIDs(guids []string) {
@@ -662,10 +871,44 @@ func (portal *Portal) HandleiMessageReadReceipt(rr *imessage.ReadReceipt) {
 }
 
 func (portal *Portal) handleMessageLoop() {
+	defer func() {
+		// Wait for any in-flight enqueue callers to finish after portal.stop closed,
+		// then drain all accepted messages while holding sendMu.Lock so no new send
+		// can slip in after the drain.
+		portal.sendMu.Lock()
+		var drained []*imessage.Message
+		for {
+			select {
+			case msg := <-portal.Messages:
+				if msg != nil {
+					drained = append(drained, msg)
+				}
+			default:
+				goto drainedAll
+			}
+		}
+	drainedAll:
+		target := portal.resolveRedirectTarget()
+		portal.sendMu.Unlock()
+
+		for _, msg := range drained {
+			portal.handleDrainedMessage(msg, target)
+		}
+		if portal.loopDone != nil {
+			close(portal.loopDone)
+		}
+	}()
 	for {
+		select {
+		case <-portal.stop:
+			return
+		default:
+		}
 		var start time.Time
 		var thing string
 		select {
+		case <-portal.stop:
+			return
 		case msg := <-portal.Messages:
 			start = time.Now()
 			thing = "iMessage"
@@ -2727,15 +2970,20 @@ func (portal *Portal) Delete() {
 
 func (portal *Portal) unlockedDelete() {
 	portal.Portal.Delete()
+	portal.unlockedRemoveFromCacheAndStop()
+}
+
+func (portal *Portal) unlockedRemoveFromCacheAndStop() {
 	delete(portal.bridge.portalsByGUID, portal.GUID)
 	for _, guid := range portal.SecondaryGUIDs {
 		if storedPortal := portal.bridge.portalsByGUID[guid]; storedPortal == portal {
-			portal.bridge.portalsByGUID[guid] = nil
+			delete(portal.bridge.portalsByGUID, guid)
 		}
 	}
-	if len(portal.MXID) > 0 {
+	if len(portal.MXID) > 0 && portal.bridge.portalsByMXID[portal.MXID] == portal {
 		delete(portal.bridge.portalsByMXID, portal.MXID)
 	}
+	portal.stopLoop()
 }
 
 func (portal *Portal) GetMatrixUsers() ([]id.UserID, error) {
@@ -2853,7 +3101,9 @@ func (portal *Portal) HandleMatrixMeta(sender bridge.User, evt *event.Event) {
 	if !portal.canManageGroup() {
 		return
 	}
-	portal.MatrixMessages <- evt
+	if !portal.enqueueMatrixEvent(evt) {
+		portal.log.Debugfln("Dropping Matrix meta event %s for stopped portal", evt.ID)
+	}
 }
 
 func (portal *Portal) handleMatrixMetaEvent(evt *event.Event) {

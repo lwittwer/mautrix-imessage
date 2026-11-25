@@ -180,18 +180,35 @@ func (portal *Portal) Update(txn dbutil.Execable) {
 	}
 }
 
-func (portal *Portal) ReID(newGUID string) {
-	_, err := portal.db.Exec("UPDATE portal SET guid=$1 WHERE guid=$2", newGUID, portal.GUID)
+func (portal *Portal) ReID(newGUID string) error {
+	return portal.ReIDExec(nil, newGUID)
+}
+
+func (portal *Portal) ReIDExec(txn dbutil.Execable, newGUID string) error {
+	if txn == nil {
+		txn = portal.db
+	}
+	_, err := txn.Exec("UPDATE portal SET guid=$1 WHERE guid=$2", newGUID, portal.GUID)
 	if err != nil {
 		portal.log.Warnfln("Failed to re-id %s: %v", portal.GUID, err)
-	} else {
-		portal.GUID = newGUID
+		return err
 	}
+	portal.GUID = newGUID
+	return nil
 }
 
 func (portal *Portal) Delete() {
-	_, err := portal.db.Exec("DELETE FROM portal WHERE guid=$1", portal.GUID)
+	_ = portal.DeleteExec(nil)
+}
+
+func (portal *Portal) DeleteExec(txn dbutil.Execable) error {
+	if txn == nil {
+		txn = portal.db
+	}
+	_, err := txn.Exec("DELETE FROM portal WHERE guid=$1", portal.GUID)
 	if err != nil {
 		portal.log.Warnfln("Failed to delete %s: %v", portal.GUID, err)
+		return err
 	}
+	return nil
 }

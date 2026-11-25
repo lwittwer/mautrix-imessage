@@ -4,11 +4,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,6 +89,25 @@ func (f *fakeBridge) DeleteKV(key string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.kv, key)
+}
+func (f *fakeBridge) DeleteKVPrefixOlderThan(prefix string, cutoff int64) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var deleted int64
+	for k, v := range f.kv {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		ts, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			continue
+		}
+		if ts < cutoff {
+			delete(f.kv, k)
+			deleted++
+		}
+	}
+	return deleted, nil
 }
 func (f *fakeBridge) IsCaptionInMessage() bool {
 	return f.captionInMessage
@@ -601,8 +622,9 @@ func TestWebSocketHandshakeEventsAndReconnect(t *testing.T) {
 				// Message send error -> status channel
 				_ = ws.WriteMessage(websocket.TextMessage, []byte(`42["message-send-error",{"guid":"err-msg-1","error":22,"chats":[{"guid":"iMessage;-;+15551234567"}]}]`))
 				// Updated message edit dedup: first edit goes to messageChan, second with same dateEdited + dateDelivered goes to messageStatusChan
-				_ = ws.WriteMessage(websocket.TextMessage, []byte(`42["updated-message",{"guid":"ed-1","text":"edited","dateCreated":1700000000000,"dateEdited":1700000005000,"chats":[{"guid":"iMessage;-;+15551234567"}]}]`))
-				_ = ws.WriteMessage(websocket.TextMessage, []byte(`42["updated-message",{"guid":"ed-1","text":"edited","dateCreated":1700000000000,"dateEdited":1700000005000,"dateDelivered":1700000006000,"chats":[{"guid":"iMessage;-;+15551234567"}]}]`))
+				baseMs := time.Now().Add(-time.Minute).UnixMilli()
+				_ = ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`42["updated-message",{"guid":"ed-1","text":"edited","dateCreated":%d,"dateEdited":%d,"chats":[{"guid":"iMessage;-;+15551234567"}]}]`, baseMs, baseMs+5000)))
+				_ = ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`42["updated-message",{"guid":"ed-1","text":"edited","dateCreated":%d,"dateEdited":%d,"dateDelivered":%d,"chats":[{"guid":"iMessage;-;+15551234567"}]}]`, baseMs, baseMs+5000, baseMs+6000)))
 
 				// Give client a moment to process, then force disconnect to test reconnect
 				time.Sleep(50 * time.Millisecond)
@@ -863,7 +885,8 @@ func TestDroppedEditNotSuppressedWhenBufferFull(t *testing.T) {
 		bb.messageChan <- &imessage.Message{GUID: "filler"}
 	}
 
-	editPayload := json.RawMessage(`{"guid":"ed-drop","text":"updated text","dateCreated":1700000000000,"dateEdited":1700000005000,"chats":[{"guid":"iMessage;-;+15551234567"}]}`)
+	baseMs := time.Now().Add(-time.Minute).UnixMilli()
+	editPayload := json.RawMessage(fmt.Sprintf(`{"guid":"ed-drop","text":"updated text","dateCreated":%d,"dateEdited":%d,"chats":[{"guid":"iMessage;-;+15551234567"}]}`, baseMs, baseMs+5000))
 
 	// First attempt drops because messageChan is full; must NOT mark edit timestamp as processed.
 	if err := bb.handleMessageUpdated(editPayload); err != nil {
@@ -900,6 +923,7 @@ func TestDroppedEditNotSuppressedWhenBufferFull(t *testing.T) {
 }
 
 func TestEditMessageSuppressesOwnEcho(t *testing.T) {
+	baseMs := time.Now().Add(-time.Minute).UnixMilli()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/message/msg-edit-1/edit" {
 			http.NotFound(w, r)
@@ -909,8 +933,8 @@ func TestEditMessageSuppressesOwnEcho(t *testing.T) {
 			Status: 200,
 			Data: Message{
 				GUID:        "msg-edit-1",
-				DateCreated: 1700000000000,
-				DateEdited:  1700000010000,
+				DateCreated: baseMs,
+				DateEdited:  baseMs + 10000,
 				IsFromMe:    true,
 				Text:        "fixed typo",
 				Chats:       []Chat{{GUID: "iMessage;-;+15551234567"}},
@@ -927,7 +951,7 @@ func TestEditMessageSuppressesOwnEcho(t *testing.T) {
 	}
 
 	// BlueBubbles echoes back an updated-message event with the same dateEdited: must NOT emit to messageChan.
-	sameEcho := json.RawMessage(`{"guid":"msg-edit-1","isFromMe":true,"text":"fixed typo","dateCreated":1700000000000,"dateEdited":1700000010000,"chats":[{"guid":"iMessage;-;+15551234567"}]}`)
+	sameEcho := json.RawMessage(fmt.Sprintf(`{"guid":"msg-edit-1","isFromMe":true,"text":"fixed typo","dateCreated":%d,"dateEdited":%d,"chats":[{"guid":"iMessage;-;+15551234567"}]}`, baseMs, baseMs+10000))
 	if err := bb.handleMessageUpdated(sameEcho); err != nil {
 		t.Fatalf("handleMessageUpdated echo failed: %v", err)
 	}
@@ -938,7 +962,7 @@ func TestEditMessageSuppressesOwnEcho(t *testing.T) {
 	}
 
 	// A subsequent edit from another Apple device with a newer dateEdited SHOULD still be bridged.
-	newerEdit := json.RawMessage(`{"guid":"msg-edit-1","isFromMe":true,"text":"edited again on phone","dateCreated":1700000000000,"dateEdited":1700000020000,"chats":[{"guid":"iMessage;-;+15551234567"}]}`)
+	newerEdit := json.RawMessage(fmt.Sprintf(`{"guid":"msg-edit-1","isFromMe":true,"text":"edited again on phone","dateCreated":%d,"dateEdited":%d,"chats":[{"guid":"iMessage;-;+15551234567"}]}`, baseMs, baseMs+20000))
 	if err := bb.handleMessageUpdated(newerEdit); err != nil {
 		t.Fatalf("handleMessageUpdated newer edit failed: %v", err)
 	}
@@ -955,13 +979,14 @@ func TestEditMessageSuppressesOwnEcho(t *testing.T) {
 func TestEditMessageSuppressesEchoWithoutDateEditedAndBeforeHTTPResponse(t *testing.T) {
 	var bb *blueBubbles
 	var triggerEarlyEcho atomic.Bool
+	baseMs := time.Now().Add(-time.Minute).UnixMilli()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/message/msg-early/edit":
 			if triggerEarlyEcho.Load() {
 				// Simulate WebSocket updated-message arriving BEFORE the HTTP response returns.
-				earlyEcho := json.RawMessage(`{"guid":"msg-early","isFromMe":true,"text":"early edit","dateCreated":1700000000000,"dateEdited":1700000030000,"chats":[{"guid":"iMessage;-;+15551234567"}]}`)
+				earlyEcho := json.RawMessage(fmt.Sprintf(`{"guid":"msg-early","isFromMe":true,"text":"early edit","dateCreated":%d,"dateEdited":%d,"chats":[{"guid":"iMessage;-;+15551234567"}]}`, baseMs, baseMs+30000))
 				if err := bb.handleMessageUpdated(earlyEcho); err != nil {
 					t.Errorf("early handleMessageUpdated failed: %v", err)
 				}
@@ -970,8 +995,8 @@ func TestEditMessageSuppressesEchoWithoutDateEditedAndBeforeHTTPResponse(t *test
 				Status: 200,
 				Data: Message{
 					GUID:        "msg-early",
-					DateCreated: 1700000000000,
-					DateEdited:  1700000030000,
+					DateCreated: baseMs,
+					DateEdited:  baseMs + 30000,
 					IsFromMe:    true,
 					Text:        "early edit",
 					Chats:       []Chat{{GUID: "iMessage;-;+15551234567"}},
@@ -983,7 +1008,7 @@ func TestEditMessageSuppressesEchoWithoutDateEditedAndBeforeHTTPResponse(t *test
 				Status: 200,
 				Data: Message{
 					GUID:        "msg-no-ts",
-					DateCreated: 1700000000000,
+					DateCreated: baseMs,
 					DateEdited:  0,
 					IsFromMe:    true,
 					Text:        "old text",
@@ -1014,7 +1039,7 @@ func TestEditMessageSuppressesEchoWithoutDateEditedAndBeforeHTTPResponse(t *test
 	if _, err := bb.EditMessage("iMessage;-;+15551234567", "msg-no-ts", "no ts edit", 0); err != nil {
 		t.Fatalf("EditMessage no-ts failed: %v", err)
 	}
-	noTsEcho := json.RawMessage(`{"guid":"msg-no-ts","isFromMe":true,"text":"no ts edit","dateCreated":1700000000000,"dateEdited":1700000040000,"chats":[{"guid":"iMessage;-;+15551234567"}]}`)
+	noTsEcho := json.RawMessage(fmt.Sprintf(`{"guid":"msg-no-ts","isFromMe":true,"text":"no ts edit","dateCreated":%d,"dateEdited":%d,"chats":[{"guid":"iMessage;-;+15551234567"}]}`, baseMs, baseMs+40000))
 	if err := bb.handleMessageUpdated(noTsEcho); err != nil {
 		t.Fatalf("handleMessageUpdated no-ts echo failed: %v", err)
 	}
@@ -1853,15 +1878,22 @@ func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
 	}
 	bb1 := api1.(*blueBubbles)
 
-	initialEdit := json.RawMessage(`{
+	baseMs := time.Now().Add(-time.Minute).UnixMilli()
+	edit1TS := baseMs + 5000
+	read1TS := baseMs + 10000
+	edit2TS := baseMs + 20000
+	delivered2TS := baseMs + 21000
+	retractTS := baseMs + 30000
+
+	initialEdit := json.RawMessage(fmt.Sprintf(`{
 		"guid": "msg-persist-1",
 		"isFromMe": true,
 		"text": "edited once",
-		"dateCreated": 1700000000000,
-		"dateEdited": 1700000005000,
+		"dateCreated": %d,
+		"dateEdited": %d,
 		"chats": [{"guid": "iMessage;-;+15551234567"}],
 		"attachments": [{"guid": "att-1", "transferName": "pic.jpg", "mimeType": "image/jpeg"}]
-	}`)
+	}`, baseMs, edit1TS))
 	if err := bb1.handleMessageUpdated(initialEdit); err != nil {
 		t.Fatalf("bb1.handleMessageUpdated failed: %v", err)
 	}
@@ -1913,8 +1945,8 @@ func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
 
 	// Once Matrix confirms delivery, the edit timestamp is persisted.
 	bb2.SendMessageBridgeResult("iMessage;-;+15551234567", "msg-persist-1", "$evt1", true)
-	if gotKV := fb.GetKV(kvEditedPrefix + "msg-persist-1"); gotKV != "1700000005000" {
-		t.Fatalf("expected persisted edit timestamp 1700000005000, got %q", gotKV)
+	if gotKV := fb.GetKV(kvEditedPrefix + "msg-persist-1"); gotKV != strconv.FormatInt(edit1TS, 10) {
+		t.Fatalf("expected persisted edit timestamp %d, got %q", edit1TS, gotKV)
 	}
 
 	// Simulate bridge restart AFTER Matrix delivery: brand new blueBubbles instance with empty in-memory map.
@@ -1926,16 +1958,16 @@ func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
 
 	// Same dateEdited arrives after restart with dateRead and an attachment:
 	// must NOT re-emit duplicate edit, must NOT download attachments, and MUST emit read receipt.
-	postRestartRead := json.RawMessage(`{
+	postRestartRead := json.RawMessage(fmt.Sprintf(`{
 		"guid": "msg-persist-1",
 		"isFromMe": true,
 		"text": "edited once",
-		"dateCreated": 1700000000000,
-		"dateEdited": 1700000005000,
-		"dateRead": 1700000010000,
+		"dateCreated": %d,
+		"dateEdited": %d,
+		"dateRead": %d,
 		"chats": [{"guid": "iMessage;-;+15551234567"}],
 		"attachments": [{"guid": "att-1", "transferName": "pic.jpg", "mimeType": "image/jpeg"}]
-	}`)
+	}`, baseMs, edit1TS, read1TS))
 	if err := bb3.handleMessageUpdated(postRestartRead); err != nil {
 		t.Fatalf("bb3.handleMessageUpdated failed: %v", err)
 	}
@@ -1957,15 +1989,15 @@ func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
 	}
 
 	// A genuinely newer edit that ALSO carries dateDelivered must forward BOTH the edit AND delivered status.
-	newerEditWithDelivered := json.RawMessage(`{
+	newerEditWithDelivered := json.RawMessage(fmt.Sprintf(`{
 		"guid": "msg-persist-1",
 		"isFromMe": true,
 		"text": "edited twice",
-		"dateCreated": 1700000000000,
-		"dateEdited": 1700000020000,
-		"dateDelivered": 1700000021000,
+		"dateCreated": %d,
+		"dateEdited": %d,
+		"dateDelivered": %d,
 		"chats": [{"guid": "iMessage;-;+15551234567"}]
-	}`)
+	}`, baseMs, edit2TS, delivered2TS))
 	if err := bb3.handleMessageUpdated(newerEditWithDelivered); err != nil {
 		t.Fatalf("bb3.handleMessageUpdated newer edit failed: %v", err)
 	}
@@ -1988,14 +2020,14 @@ func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
 	bb3.SendMessageBridgeResult("iMessage;-;+15551234567", "msg-persist-1", "$evt2", true)
 
 	// Confirming a retraction cleans up the persisted bb_edit:<guid> KV row.
-	retractUpdate := json.RawMessage(`{
+	retractUpdate := json.RawMessage(fmt.Sprintf(`{
 		"guid": "msg-persist-1",
 		"isFromMe": true,
-		"dateCreated": 1700000000000,
-		"dateEdited": 1700000020000,
-		"dateRetracted": 1700000030000,
+		"dateCreated": %d,
+		"dateEdited": %d,
+		"dateRetracted": %d,
 		"chats": [{"guid": "iMessage;-;+15551234567"}]
-	}`)
+	}`, baseMs, edit2TS, retractTS))
 	if err := bb3.handleMessageUpdated(retractUpdate); err != nil {
 		t.Fatalf("bb3.handleMessageUpdated retract failed: %v", err)
 	}
@@ -2132,22 +2164,25 @@ func TestAckingEditADoesNotPersistQueuedEditB(t *testing.T) {
 	}
 	bb1 := api1.(*blueBubbles)
 
-	editA := json.RawMessage(`{
+	baseMs := time.Now().Add(-time.Minute).UnixMilli()
+	editATS := baseMs + 10000
+	editBTS := baseMs + 20000
+	editA := json.RawMessage(fmt.Sprintf(`{
 		"guid": "msg-ab",
 		"isFromMe": true,
 		"text": "edit A",
-		"dateCreated": 1700000000000,
-		"dateEdited": 1700000010000,
+		"dateCreated": %d,
+		"dateEdited": %d,
 		"chats": [{"guid": "iMessage;-;+15551234567"}]
-	}`)
-	editB := json.RawMessage(`{
+	}`, baseMs, editATS))
+	editB := json.RawMessage(fmt.Sprintf(`{
 		"guid": "msg-ab",
 		"isFromMe": true,
 		"text": "edit B",
-		"dateCreated": 1700000000000,
-		"dateEdited": 1700000020000,
+		"dateCreated": %d,
+		"dateEdited": %d,
 		"chats": [{"guid": "iMessage;-;+15551234567"}]
-	}`)
+	}`, baseMs, editBTS))
 
 	// Enqueue both edit A and edit B before either is acknowledged by Matrix.
 	if err := bb1.handleMessageUpdated(editA); err != nil {
@@ -2164,8 +2199,8 @@ func TestAckingEditADoesNotPersistQueuedEditB(t *testing.T) {
 
 	// Acknowledge ONLY edit A. Edit B is still unacknowledged when the bridge restarts.
 	bb1.SendMessageBridgeResult("iMessage;-;+15551234567", "msg-ab", "$evtA", true)
-	if gotKV := fb.GetKV(kvEditedPrefix + "msg-ab"); gotKV != "1700000010000" {
-		t.Fatalf("expected only edit A timestamp (1700000010000) persisted, got %q", gotKV)
+	if gotKV := fb.GetKV(kvEditedPrefix + "msg-ab"); gotKV != strconv.FormatInt(editATS, 10) {
+		t.Fatalf("expected only edit A timestamp (%d) persisted, got %q", editATS, gotKV)
 	}
 
 	// Simulate restart: edit A must be suppressed, while edit B MUST remain retryable.
@@ -2194,5 +2229,343 @@ func TestAckingEditADoesNotPersistQueuedEditB(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected unacknowledged edit B to remain retryable after restart")
+	}
+}
+
+func TestCustomEmojiTapbacksConfigAndServerVersionHelper(t *testing.T) {
+	var gotReactions []SendReactionRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/server/info":
+			_ = json.NewEncoder(w).Encode(ServerInfoResponse{
+				Status: 200,
+				Data:   ServerInfo{ServerVersion: "1.9.7", PrivateAPI: true},
+			})
+		case "/api/v1/message/react":
+			var req SendReactionRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			gotReactions = append(gotReactions, req)
+			_ = json.NewEncoder(w).Encode(SendReactionResponse{
+				Status: 200,
+				Data:   Message{GUID: "react-1", DateCreated: 1700000000000},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	// Default config: gated off even after applyServerInfo with Private API enabled.
+	bbDefault, _ := newTestConnector(t, srv.URL)
+	bbDefault.refreshPrivateAPI()
+	if bbDefault.Capabilities().SendCustomEmojiTapbacks {
+		t.Fatal("expected SendCustomEmojiTapbacks to stay false by default after applyServerInfo")
+	}
+
+	// Explicit config opt-in: enabled when Private API is true, disabled when Private API is false.
+	fb := newFakeBridge(srv.URL, "secret-pw")
+	fb.cfg.BlueBubblesCustomEmojiReactions = true
+	apiOptIn, err := NewBlueBubblesConnector(fb)
+	if err != nil {
+		t.Fatalf("NewBlueBubblesConnector failed: %v", err)
+	}
+	bbOptIn := apiOptIn.(*blueBubbles)
+	if bbOptIn.Capabilities().SendCustomEmojiTapbacks {
+		t.Fatal("expected SendCustomEmojiTapbacks to require Private API even when opted in")
+	}
+	bbOptIn.refreshPrivateAPI()
+	if !bbOptIn.Capabilities().SendCustomEmojiTapbacks {
+		t.Fatal("expected SendCustomEmojiTapbacks to be true when opted in and Private API is active")
+	}
+	if _, err := bbOptIn.SendCustomEmojiTapback("iMessage;-;+15551234567", "msg-1", 0, "🎉", false); err != nil {
+		t.Fatalf("SendCustomEmojiTapback failed: %v", err)
+	}
+	if len(gotReactions) != 1 || gotReactions[0].Reaction != "🎉" {
+		t.Fatalf("unexpected custom emoji reaction request: %+v", gotReactions)
+	}
+
+	// Verify SemVer 2.0.0 comparison helper behavior (including prerelease precedence)
+	// for future server_version auto-detection.
+	if serverVersionAtLeast("1.9.7", "") {
+		t.Fatal("empty minVersion must always return false")
+	}
+	if serverVersionAtLeast("v1.10.0-beta.1", "1.10.0") {
+		t.Fatal("expected prerelease v1.10.0-beta.1 < stable 1.10.0")
+	}
+	if !serverVersionAtLeast("1.10.0", "1.10.0-beta.1") {
+		t.Fatal("expected stable 1.10.0 >= prerelease 1.10.0-beta.1")
+	}
+	if !serverVersionAtLeast("v1.10.0-beta.2", "1.10.0-beta.1") {
+		t.Fatal("expected v1.10.0-beta.2 >= 1.10.0-beta.1")
+	}
+	if !serverVersionAtLeast("v1.10.0-beta.10", "1.10.0-beta.2") {
+		t.Fatal("expected numeric prerelease identifier 10 > 2")
+	}
+	if !serverVersionAtLeast("v1.10.1-beta.1", "1.10.0") {
+		t.Fatal("expected v1.10.1-beta.1 >= 1.10.0")
+	}
+	if !serverVersionAtLeast("2.0", "1.10.5") {
+		t.Fatal("expected 2.0 >= 1.10.5")
+	}
+	if serverVersionAtLeast("1.9.9", "1.10.0") {
+		t.Fatal("expected 1.9.9 < 1.10.0")
+	}
+	if serverVersionAtLeast("invalid", "1.0.0") {
+		t.Fatal("expected invalid version to return false")
+	}
+}
+
+func TestReconnectCatchUpEarlyStopBoundsChatPagination(t *testing.T) {
+	now := time.Now()
+	since := now.Add(-2 * time.Minute)
+	editLookback := since.Add(-defaultEditRetractLookback)
+
+	var pagesRequested []int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/chat/query" {
+			http.NotFound(w, r)
+			return
+		}
+		var req ChatQueryRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		pagesRequested = append(pagesRequested, req.Offset)
+
+		switch req.Offset {
+		case 0:
+			// Page 1: active recent chat + quiet chat 1h ago (both within 24h scan window -> fetch page 2)
+			_ = json.NewEncoder(w).Encode(ChatQueryResponse{
+				Status: 200,
+				Data: []Chat{
+					{
+						GUID:        "iMessage;-;+15550000001",
+						LastMessage: &Message{GUID: "m-recent", DateCreated: now.Add(-30 * time.Second).UnixMilli()},
+					},
+					{
+						GUID:        "iMessage;-;+15550000002",
+						LastMessage: &Message{GUID: "m-quiet-untouched", DateCreated: now.Add(-1 * time.Hour).UnixMilli()},
+					},
+				},
+				Metadata: PageMetadata{Total: 6, Limit: 2, Offset: 0, Count: 2},
+			})
+		case 2:
+			// Page 2: quiet chat created 2h ago whose LastMessage was retracted during disconnect,
+			// followed by an old chat created 48h ago (past 24h scan window -> early stop!).
+			_ = json.NewEncoder(w).Encode(ChatQueryResponse{
+				Status: 200,
+				Data: []Chat{
+					{
+						GUID: "iMessage;-;+15550000003",
+						LastMessage: &Message{
+							GUID:          "m-2h-retracted",
+							DateCreated:   now.Add(-2 * time.Hour).UnixMilli(),
+							DateRetracted: now.Add(-10 * time.Second).UnixMilli(),
+						},
+					},
+					{
+						GUID:        "iMessage;-;+15550000004",
+						LastMessage: &Message{GUID: "m-48h-old", DateCreated: now.Add(-48 * time.Hour).UnixMilli()},
+					},
+				},
+				Metadata: PageMetadata{Total: 6, Limit: 2, Offset: 2, Count: 2},
+			})
+		default:
+			t.Errorf("early stop failed: requested historical chat page at offset=%d", req.Offset)
+			http.Error(w, "should have stopped paginating", http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+	active, err := bb.getChatsWithActivityAfter(since, editLookback)
+	if err != nil {
+		t.Fatalf("getChatsWithActivityAfter failed: %v", err)
+	}
+	if len(pagesRequested) != 2 || pagesRequested[0] != 0 || pagesRequested[1] != 2 {
+		t.Fatalf("expected exactly 2 chat pages [0, 2], got %v", pagesRequested)
+	}
+	if len(active) != 2 {
+		t.Fatalf("expected 2 active chats (recent + 2h-old retracted quiet chat), got %d: %+v", len(active), active)
+	}
+	if active[0].GUID != "iMessage;-;+15550000001" || active[1].GUID != "iMessage;-;+15550000003" {
+		t.Fatalf("unexpected active chats: %+v", active)
+	}
+}
+
+func TestEditKVCleanupPrunesExpiredEntries(t *testing.T) {
+	fb := newFakeBridge("http://localhost:1234", "secret-pw")
+	api, err := NewBlueBubblesConnector(fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bb := api.(*blueBubbles)
+	bb.editKVTTL = 7 * 24 * time.Hour
+	bb.editKVCleanupInterval = 20 * time.Millisecond
+
+	now := time.Now()
+	expiredTS := now.Add(-10 * 24 * time.Hour).UnixMilli()
+	freshTS := now.Add(-2 * 24 * time.Hour).UnixMilli()
+
+	bb.markEdited("msg-expired", expiredTS)
+	bb.markEdited("msg-fresh", freshTS)
+	fb.SetKV("unrelated_key", strconv.FormatInt(expiredTS, 10))
+
+	// Run cleanup loop briefly and verify both initial cleanup and clean shutdown on Stop().
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bb.editKVCleanupLoop()
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if fb.GetKV(kvEditedPrefix+"msg-expired") == "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if got := fb.GetKV(kvEditedPrefix + "msg-expired"); got != "" {
+		t.Fatalf("expected expired bb_edit KV entry to be pruned, got %q", got)
+	}
+	if got := fb.GetKV(kvEditedPrefix + "msg-fresh"); got != strconv.FormatInt(freshTS, 10) {
+		t.Fatalf("expected fresh bb_edit KV entry to remain, got %q", got)
+	}
+	if got := fb.GetKV("unrelated_key"); got != strconv.FormatInt(expiredTS, 10) {
+		t.Fatalf("expected unrelated KV entry to remain untouched, got %q", got)
+	}
+
+	bb.editedLock.Lock()
+	_, expiredInMem := bb.lastEdited["msg-expired"]
+	freshInMemTS := bb.lastEdited["msg-fresh"]
+	bb.editedLock.Unlock()
+	if expiredInMem {
+		t.Fatal("expected expired entry to also be pruned from in-memory lastEdited")
+	}
+	if freshInMemTS != freshTS {
+		t.Fatalf("expected fresh in-memory lastEdited entry %d, got %d", freshTS, freshInMemTS)
+	}
+
+	// Verify periodic tick prunes an entry added after loop startup.
+	bb.markEdited("msg-expired-later", expiredTS)
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if fb.GetKV(kvEditedPrefix+"msg-expired-later") == "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := fb.GetKV(kvEditedPrefix + "msg-expired-later"); got != "" {
+		t.Fatalf("expected periodic tick to prune msg-expired-later, got %q", got)
+	}
+
+	bb.Stop()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("editKVCleanupLoop did not exit cleanly on Stop()")
+	}
+
+	// After msg-expired's bb_edit: row was pruned, a later updated-message (e.g. a
+	// read receipt) carrying that expired dateEdited must NOT re-bridge a duplicate
+	// edit, while still forwarding the read receipt.
+	lateRead := json.RawMessage(fmt.Sprintf(`{
+		"guid": "msg-expired",
+		"isFromMe": true,
+		"text": "old edited text",
+		"dateCreated": %d,
+		"dateEdited": %d,
+		"dateRead": %d,
+		"chats": [{"guid": "iMessage;-;+15551234567"}]
+	}`, expiredTS-1000, expiredTS, now.UnixMilli()))
+	if err := bb.handleMessageUpdated(lateRead); err != nil {
+		t.Fatalf("handleMessageUpdated for pruned edit failed: %v", err)
+	}
+	select {
+	case dup := <-bb.MessageChan():
+		t.Fatalf("expected pruned edit older than TTL not to re-bridge, got %+v", dup)
+	default:
+	}
+	select {
+	case rr := <-bb.ReadReceiptChan():
+		if rr.ReadUpTo != "msg-expired" {
+			t.Fatalf("unexpected read receipt for pruned edit: %+v", rr)
+		}
+	default:
+		t.Fatal("expected read receipt on pruned edited message to still be forwarded")
+	}
+}
+
+func TestReconnectCatchUpRecoversEditDuring31DayDisconnect(t *testing.T) {
+	now := time.Now()
+	since := now.Add(-31 * 24 * time.Hour)
+	editLookback := since.Add(-defaultEditRetractLookback)
+	createdMs := since.Add(-5 * time.Minute).UnixMilli()
+	editedMs := since.Add(1 * time.Minute).UnixMilli()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/chat/iMessage;-;+15558889999/message" {
+			_ = json.NewEncoder(w).Encode(MessageQueryResponse{
+				Status: 200,
+				Data: []Message{
+					{
+						GUID:        "msg-31d-edit",
+						DateCreated: createdMs,
+						DateEdited:  editedMs,
+						Text:        "edited during 31-day outage",
+						Handle:      Handle{Address: "+15558889999", Service: "iMessage"},
+						Chats:       []Chat{{GUID: "iMessage;-;+15558889999"}},
+					},
+				},
+				Metadata: PageMetadata{Total: 1, Limit: 100, Offset: 0, Count: 1},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+	chat := Chat{
+		GUID: "iMessage;-;+15558889999",
+		LastMessage: &Message{
+			GUID:        "msg-31d-edit",
+			DateCreated: createdMs,
+			DateEdited:  editedMs,
+			Text:        "edited during 31-day outage",
+		},
+	}
+
+	enqueued, err := bb.catchUpChat(chat, since, editLookback)
+	if err != nil {
+		t.Fatalf("catchUpChat failed: %v", err)
+	}
+	if enqueued != 1 {
+		t.Fatalf("expected 1 edit recovered during 31-day disconnect catch-up, got %d", enqueued)
+	}
+	select {
+	case msg := <-bb.MessageChan():
+		if msg.GUID != "msg-31d-edit" || !msg.IsEdited || msg.Text != "edited during 31-day outage" {
+			t.Fatalf("unexpected recovered edit: %+v", msg)
+		}
+	default:
+		t.Fatal("expected recovered 31-day disconnect edit on MessageChan")
+	}
+
+	// Unsolicited updated-message for a different 31-day-old edit MUST still be blocked by editKVTTL.
+	unsolicitedOld := json.RawMessage(fmt.Sprintf(`{
+		"guid": "msg-31d-unsolicited",
+		"isFromMe": true,
+		"text": "stale unsolicited edit",
+		"dateCreated": %d,
+		"dateEdited": %d,
+		"chats": [{"guid": "iMessage;-;+15558889999"}]
+	}`, createdMs, editedMs))
+	if err := bb.handleMessageUpdated(unsolicitedOld); err != nil {
+		t.Fatalf("handleMessageUpdated failed: %v", err)
+	}
+	select {
+	case dup := <-bb.MessageChan():
+		t.Fatalf("expected unsolicited 31-day-old edit to be rejected by TTL guard, got %+v", dup)
+	default:
 	}
 }
