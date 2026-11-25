@@ -204,6 +204,7 @@ func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
 		if err != nil {
 			imh.log.Warnfln("Failed to create Matrix room to handle message: %v", err)
 			msg.CleanupTempAttachments()
+			imh.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, "", false)
 			return
 		}
 	}
@@ -212,6 +213,7 @@ func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
 	case <-time.After(PortalBufferTimeout):
 		imh.log.Errorln("Portal message buffer is still full after 10 seconds, dropping message %s", msg.GUID)
 		msg.CleanupTempAttachments()
+		imh.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, "", false)
 	}
 }
 

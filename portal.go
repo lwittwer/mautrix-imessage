@@ -116,8 +116,14 @@ func (portal *Portal) reIDInto(newGUID string, newPortal *Portal, lock, mergeExi
 		br.portalsLock.Lock()
 		defer br.portalsLock.Unlock()
 	}
+	if portal.GUID == newGUID {
+		return true
+	}
 	if newPortal == nil {
 		newPortal = br.maybeGetPortalByGUID(nil, newGUID, false)
+	}
+	if newPortal == portal {
+		return true
 	}
 	if newPortal != nil {
 		if mergeExisting && portal.MXID != "" && newPortal.MXID != "" && br.Config.Homeserver.Software == bridgeconfig.SoftwareHungry {
@@ -178,6 +184,9 @@ func (br *IMBridge) bindExistingDMPortal(targetGUID, preferredService string) *P
 	if parsed.IsGroup || parsed.LocalID == "" {
 		return nil
 	}
+	br.dmBindLock.Lock()
+	defer br.dmBindLock.Unlock()
+
 	if existing := br.GetPortalByGUIDIfExists(targetGUID); existing != nil && len(existing.MXID) > 0 {
 		return existing
 	}
@@ -2399,8 +2408,11 @@ func (portal *Portal) handleNormaliMessage(msg *imessage.Message, dbMessage *dat
 	if len(parts) == 0 {
 		if mxid == nil {
 			portal.log.Warnfln("iMessage %s doesn't contain any attachments nor text", msg.GUID)
+			return false
 		}
-		return false
+		// Intentionally skipped edits (e.g. no stored caption part) should be acknowledged
+		// so they are not replayed on every subsequent delivery/read update.
+		return true
 	}
 	allSucceeded := true
 	for index, converted := range parts {
@@ -2537,6 +2549,9 @@ func (portal *Portal) HandleiMessage(msg *imessage.Message) id.EventID {
 			intent := portal.getIntentForMessage(msg, nil)
 			if intent != nil {
 				bridgeSuccess = portal.handleNormaliMessage(msg, dbMessage, intent, &dbMessage.MXID)
+			} else {
+				// Intentionally dropped (e.g. double puppeting disabled): treat as done.
+				bridgeSuccess = true
 			}
 		} else if msg.IsRead && msg.IsFromMe {
 

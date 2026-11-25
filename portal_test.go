@@ -896,3 +896,72 @@ func TestNoteMessageServiceUpdatesGroupPowerLevelsImmediately(t *testing.T) {
 		t.Fatalf("expected power levels to update immediately on iMessage confirmation, called=%v invite=%d kick=%d", setPLCalled, gotInvite, gotKick)
 	}
 }
+
+func TestOverlappingDMMigrationsPreserveRoomMapping(t *testing.T) {
+	rawDB, err := dbutil.NewWithDialect("file:overlap_dm_migration_test?mode=memory&cache=shared&_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	defer rawDB.Close()
+
+	db := database.New(rawDB, log.DefaultLogger)
+	if err := db.Upgrade(); err != nil {
+		t.Fatalf("database upgrade failed: %v", err)
+	}
+
+	zlog := zerolog.Nop()
+	br := &IMBridge{
+		DB:            db,
+		Config:        &config.Config{BaseConfig: &bridgeconfig.BaseConfig{}},
+		portalsByGUID: make(map[string]*Portal),
+		portalsByMXID: make(map[id.RoomID]*Portal),
+		puppets:       make(map[string]*Puppet),
+		IM:            &fakeTestIMAPI{resolvedGUID: "any;-;+15559990000"},
+	}
+	br.Log = log.DefaultLogger
+	br.ZLog = &zlog
+	br.puppets["+15559990000"] = &Puppet{
+		Puppet: &database.Puppet{ID: "+15559990000"},
+		bridge: br,
+		MXID:   "@imessage_15559990000:example.com",
+		Intent: &appservice.IntentAPI{UserID: "@imessage_15559990000:example.com"},
+	}
+
+	dbPortal := db.Portal.New()
+	dbPortal.GUID = "iMessage;-;+15559990000"
+	dbPortal.MXID = id.RoomID("!keep-this-room:example.com")
+	dbPortal.Insert(nil)
+
+	// Run overlapping concurrent bindExistingDMPortal and duplicate reIDInto calls.
+	const workers = 8
+	start := make(chan struct{})
+	done := make(chan *Portal, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			done <- br.bindExistingDMPortal("any;-;+15559990000", "iMessage")
+		}()
+	}
+	close(start)
+
+	for i := 0; i < workers; i++ {
+		p := <-done
+		if p == nil || p.MXID != "!keep-this-room:example.com" || p.GUID != "any;-;+15559990000" {
+			t.Fatalf("overlapping migration returned unexpected portal: %+v", p)
+		}
+	}
+
+	// Direct duplicate reIDInto on the already-migrated portal must also be a safe no-op.
+	migrated := br.GetPortalByGUID("any;-;+15559990000")
+	if !migrated.reIDInto("any;-;+15559990000", nil, true, false) {
+		t.Fatal("duplicate reIDInto to same GUID should return true without deleting portal")
+	}
+
+	// Verify SQLite still holds the original room mapping under both GUIDs.
+	if row := db.Portal.GetByGUID("any;-;+15559990000"); row == nil || row.MXID != "!keep-this-room:example.com" {
+		t.Fatalf("expected DB row for any;-;+15559990000 with original room, got %+v", row)
+	}
+	if row := db.Portal.GetByGUID("iMessage;-;+15559990000"); row == nil || row.MXID != "!keep-this-room:example.com" {
+		t.Fatalf("expected DB alias for iMessage;-;+15559990000 with original room, got %+v", row)
+	}
+}

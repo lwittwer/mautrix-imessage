@@ -80,6 +80,7 @@ type IMBridge struct {
 	portalsByMXID map[id.RoomID]*Portal
 	portalsByGUID map[string]*Portal
 	portalsLock   sync.Mutex
+	dmBindLock    sync.Mutex
 	userCache     map[id.UserID]*User
 	puppets       map[string]*Puppet
 	puppetsLock   sync.Mutex

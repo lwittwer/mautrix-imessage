@@ -2123,3 +2123,76 @@ func TestQueryChatsPaginationGuardAndFullPreLookbackFetch(t *testing.T) {
 		t.Fatal("expected hydrated pre-lookback edit on MessageChan")
 	}
 }
+
+func TestAckingEditADoesNotPersistQueuedEditB(t *testing.T) {
+	fb := newFakeBridge("http://localhost:1234", "secret-pw")
+	api1, err := NewBlueBubblesConnector(fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bb1 := api1.(*blueBubbles)
+
+	editA := json.RawMessage(`{
+		"guid": "msg-ab",
+		"isFromMe": true,
+		"text": "edit A",
+		"dateCreated": 1700000000000,
+		"dateEdited": 1700000010000,
+		"chats": [{"guid": "iMessage;-;+15551234567"}]
+	}`)
+	editB := json.RawMessage(`{
+		"guid": "msg-ab",
+		"isFromMe": true,
+		"text": "edit B",
+		"dateCreated": 1700000000000,
+		"dateEdited": 1700000020000,
+		"chats": [{"guid": "iMessage;-;+15551234567"}]
+	}`)
+
+	// Enqueue both edit A and edit B before either is acknowledged by Matrix.
+	if err := bb1.handleMessageUpdated(editA); err != nil {
+		t.Fatalf("handleMessageUpdated A failed: %v", err)
+	}
+	if err := bb1.handleMessageUpdated(editB); err != nil {
+		t.Fatalf("handleMessageUpdated B failed: %v", err)
+	}
+	msgA := <-bb1.MessageChan()
+	msgB := <-bb1.MessageChan()
+	if msgA.Text != "edit A" || msgB.Text != "edit B" {
+		t.Fatalf("unexpected queued edits: A=%+v B=%+v", msgA, msgB)
+	}
+
+	// Acknowledge ONLY edit A. Edit B is still unacknowledged when the bridge restarts.
+	bb1.SendMessageBridgeResult("iMessage;-;+15551234567", "msg-ab", "$evtA", true)
+	if gotKV := fb.GetKV(kvEditedPrefix + "msg-ab"); gotKV != "1700000010000" {
+		t.Fatalf("expected only edit A timestamp (1700000010000) persisted, got %q", gotKV)
+	}
+
+	// Simulate restart: edit A must be suppressed, while edit B MUST remain retryable.
+	api2, err := NewBlueBubblesConnector(fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bb2 := api2.(*blueBubbles)
+
+	if err := bb2.handleMessageUpdated(editA); err != nil {
+		t.Fatalf("bb2 handleMessageUpdated A failed: %v", err)
+	}
+	select {
+	case dup := <-bb2.MessageChan():
+		t.Fatalf("expected already-acked edit A to be suppressed after restart, got %+v", dup)
+	default:
+	}
+
+	if err := bb2.handleMessageUpdated(editB); err != nil {
+		t.Fatalf("bb2 handleMessageUpdated B failed: %v", err)
+	}
+	select {
+	case retried := <-bb2.MessageChan():
+		if retried.Text != "edit B" {
+			t.Fatalf("unexpected retried edit B: %+v", retried)
+		}
+	default:
+		t.Fatal("expected unacknowledged edit B to remain retryable after restart")
+	}
+}

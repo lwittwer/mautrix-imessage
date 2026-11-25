@@ -304,7 +304,7 @@ func (mx *WebsocketCommandHandler) StartChat(req StartDMRequest) (*StartDMRespon
 	// or a concrete service ("iMessage;-;", "RCS;-;", "SMS;-;"). Reuse an existing room in
 	// either direction and persist the GUID binding so inbound messages and outbound replies
 	// both use the original room and current BlueBubbles chat.
-	if !parsed.IsGroup && parsed.LocalID != "" {
+	if req.ActuallyStart && !parsed.IsGroup && parsed.LocalID != "" {
 		if reused := mx.bridge.bindExistingDMPortal(resp.GUID, ""); reused != nil {
 			resp.GUID = reused.GUID
 			parsed = reused.Identifier

@@ -106,7 +106,7 @@ type blueBubbles struct {
 
 	editedLock          sync.Mutex
 	lastEdited          map[string]int64
-	inflightEdits       map[string]int64
+	inflightEdits       map[string][]int64
 	inflightRetractions map[string]struct{}
 	pendingEdits        map[string]pendingEdit
 	pendingGroupNames   map[string]pendingGroupName
@@ -172,7 +172,7 @@ func NewBlueBubblesConnector(bridge imessage.Bridge) (imessage.API, error) {
 
 		contactRefreshInterval: defaultContactRefreshInterval,
 		lastEdited:             make(map[string]int64),
-		inflightEdits:          make(map[string]int64),
+		inflightEdits:          make(map[string][]int64),
 		inflightRetractions:    make(map[string]struct{}),
 		pendingEdits:           make(map[string]pendingEdit),
 		pendingGroupNames:      make(map[string]pendingGroupName),
@@ -1014,9 +1014,17 @@ func (bb *blueBubbles) isNewEdit(guid string, dateEdited int64) bool {
 		return false
 	}
 	bb.editedLock.Lock()
-	if prev, ok := bb.inflightEdits[guid]; ok && dateEdited <= prev {
-		bb.editedLock.Unlock()
-		return false
+	if queue := bb.inflightEdits[guid]; len(queue) > 0 {
+		maxInflight := queue[len(queue)-1]
+		for _, ts := range queue {
+			if ts > maxInflight {
+				maxInflight = ts
+			}
+		}
+		if dateEdited <= maxInflight {
+			bb.editedLock.Unlock()
+			return false
+		}
 	}
 	if prev, ok := bb.lastEdited[guid]; ok {
 		bb.editedLock.Unlock()
@@ -1047,11 +1055,9 @@ func (bb *blueBubbles) markEditInflight(guid string, dateEdited int64) {
 	}
 	bb.editedLock.Lock()
 	if bb.inflightEdits == nil {
-		bb.inflightEdits = make(map[string]int64)
+		bb.inflightEdits = make(map[string][]int64)
 	}
-	if prev, ok := bb.inflightEdits[guid]; !ok || dateEdited > prev {
-		bb.inflightEdits[guid] = dateEdited
-	}
+	bb.inflightEdits[guid] = append(bb.inflightEdits[guid], dateEdited)
 	bb.editedLock.Unlock()
 }
 
@@ -3591,9 +3597,16 @@ func (bb *blueBubbles) SendMessageBridgeResult(chatID, messageID string, eventID
 		return
 	}
 	bb.editedLock.Lock()
-	editTS, hasEdit := bb.inflightEdits[messageID]
-	if hasEdit {
-		delete(bb.inflightEdits, messageID)
+	var editTS int64
+	var hasEdit bool
+	if queue := bb.inflightEdits[messageID]; len(queue) > 0 {
+		editTS = queue[0]
+		hasEdit = true
+		if len(queue) == 1 {
+			delete(bb.inflightEdits, messageID)
+		} else {
+			bb.inflightEdits[messageID] = queue[1:]
+		}
 	}
 	_, hasRetraction := bb.inflightRetractions[messageID]
 	if hasRetraction {
@@ -3601,6 +3614,7 @@ func (bb *blueBubbles) SendMessageBridgeResult(chatID, messageID string, eventID
 	}
 	if success && hasRetraction {
 		delete(bb.lastEdited, messageID)
+		delete(bb.inflightEdits, messageID)
 	}
 	bb.editedLock.Unlock()
 
