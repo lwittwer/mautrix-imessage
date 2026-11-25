@@ -302,23 +302,12 @@ func (mx *WebsocketCommandHandler) StartChat(req StartDMRequest) (*StartDMRespon
 	}
 	// On macOS Sequoia+, an existing DM portal may be keyed under either "any;-;<localID>"
 	// or a concrete service ("iMessage;-;", "RCS;-;", "SMS;-;"). Reuse an existing room in
-	// either direction to avoid creating duplicate rooms for the same contact.
+	// either direction and persist the GUID binding so inbound messages and outbound replies
+	// both use the original room and current BlueBubbles chat.
 	if !parsed.IsGroup && parsed.LocalID != "" {
-		if existing := mx.bridge.GetPortalByGUIDIfExists(resp.GUID); existing == nil || len(existing.MXID) == 0 {
-			var fallbackServices []string
-			if parsed.Service == "any" {
-				fallbackServices = []string{"iMessage", "RCS", "SMS"}
-			} else {
-				fallbackServices = []string{"any"}
-			}
-			for _, svc := range fallbackServices {
-				candGUID := imessage.Identifier{Service: svc, LocalID: parsed.LocalID}.String()
-				if candPortal := mx.bridge.GetPortalByGUIDIfExists(candGUID); candPortal != nil && len(candPortal.MXID) > 0 {
-					resp.GUID = candPortal.GUID
-					parsed = candPortal.Identifier
-					break
-				}
-			}
+		if reused := mx.bridge.bindExistingDMPortal(resp.GUID, ""); reused != nil {
+			resp.GUID = reused.GUID
+			parsed = reused.Identifier
 		}
 	}
 	if portal := mx.bridge.GetPortalByGUID(resp.GUID); len(portal.MXID) > 0 || !req.ActuallyStart {

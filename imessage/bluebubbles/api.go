@@ -104,10 +104,12 @@ type blueBubbles struct {
 	contacts               []Contact
 	contactRefreshInterval time.Duration
 
-	editedLock        sync.Mutex
-	lastEdited        map[string]int64
-	pendingEdits      map[string]pendingEdit
-	pendingGroupNames map[string]pendingGroupName
+	editedLock          sync.Mutex
+	lastEdited          map[string]int64
+	inflightEdits       map[string]int64
+	inflightRetractions map[string]struct{}
+	pendingEdits        map[string]pendingEdit
+	pendingGroupNames   map[string]pendingGroupName
 
 	httpClient      *http.Client
 	probeHTTPClient *http.Client
@@ -170,6 +172,8 @@ func NewBlueBubblesConnector(bridge imessage.Bridge) (imessage.API, error) {
 
 		contactRefreshInterval: defaultContactRefreshInterval,
 		lastEdited:             make(map[string]int64),
+		inflightEdits:          make(map[string]int64),
+		inflightRetractions:    make(map[string]struct{}),
 		pendingEdits:           make(map[string]pendingEdit),
 		pendingGroupNames:      make(map[string]pendingGroupName),
 
@@ -861,6 +865,9 @@ func (bb *blueBubbles) catchUpChat(chat Chat, since, editLookback time.Time) (in
 		}
 		if !inRaw {
 			lm := *chat.LastMessage
+			if full, fetchErr := bb.getMessageWithDetails(chat.LastMessage.GUID); fetchErr == nil && full != nil && full.GUID != "" {
+				lm = *full
+			}
 			if len(lm.Chats) == 0 {
 				lm.Chats = []Chat{{GUID: chatID, GroupID: chat.GroupID}}
 			}
@@ -920,7 +927,7 @@ func (bb *blueBubbles) catchUpChat(chat Chat, since, editLookback time.Time) (in
 			continue
 		}
 
-		downloadAttachments := !isRetracted && (!alreadySeen || isNewEdit)
+		downloadAttachments := !isRetracted && (!alreadySeen || bb.shouldDownloadEditAttachments(len(raw.Attachments)))
 		converted, convErr := bb.convertBBMessageToiMessageWithOptions(raw, downloadAttachments)
 		if convErr != nil {
 			bb.log.Warn().Err(convErr).Str("guid", raw.GUID).Str("chatGUID", chatID).Msg("Failed to convert catch-up message")
@@ -930,8 +937,10 @@ func (bb *blueBubbles) catchUpChat(chat Chat, since, editLookback time.Time) (in
 		select {
 		case bb.messageChan <- converted:
 			enqueued++
-			if raw.DateEdited != 0 {
-				bb.markEdited(raw.GUID, raw.DateEdited)
+			if isRetracted {
+				bb.markRetractionInflight(raw.GUID)
+			} else if raw.DateEdited != 0 {
+				bb.markEditInflight(raw.GUID, raw.DateEdited)
 			}
 		case <-bb.context().Done():
 			converted.CleanupTempAttachments()
@@ -982,11 +991,33 @@ func (bb *blueBubbles) persistEditTS(guid string, dateEdited int64) {
 	kv.SetKV(kvEditedPrefix+guid, strconv.FormatInt(dateEdited, 10))
 }
 
+func (bb *blueBubbles) deletePersistedEditTS(guid string) {
+	kv, ok := bb.bridge.(imessage.KVStore)
+	if !ok || kv == nil {
+		return
+	}
+	kv.DeleteKV(kvEditedPrefix + guid)
+}
+
+func (bb *blueBubbles) shouldDownloadEditAttachments(attachmentCount int) bool {
+	if attachmentCount == 0 || attachmentCount > 1 {
+		return false
+	}
+	if cfg, ok := bb.bridge.(imessage.CaptionConfig); ok && cfg != nil && !cfg.IsCaptionInMessage() {
+		return false
+	}
+	return true
+}
+
 func (bb *blueBubbles) isNewEdit(guid string, dateEdited int64) bool {
 	if guid == "" || dateEdited == 0 {
 		return false
 	}
 	bb.editedLock.Lock()
+	if prev, ok := bb.inflightEdits[guid]; ok && dateEdited <= prev {
+		bb.editedLock.Unlock()
+		return false
+	}
 	if prev, ok := bb.lastEdited[guid]; ok {
 		bb.editedLock.Unlock()
 		return dateEdited > prev
@@ -1008,6 +1039,32 @@ func (bb *blueBubbles) isNewEdit(guid string, dateEdited int64) bool {
 		return dateEdited > persisted
 	}
 	return true
+}
+
+func (bb *blueBubbles) markEditInflight(guid string, dateEdited int64) {
+	if guid == "" || dateEdited == 0 {
+		return
+	}
+	bb.editedLock.Lock()
+	if bb.inflightEdits == nil {
+		bb.inflightEdits = make(map[string]int64)
+	}
+	if prev, ok := bb.inflightEdits[guid]; !ok || dateEdited > prev {
+		bb.inflightEdits[guid] = dateEdited
+	}
+	bb.editedLock.Unlock()
+}
+
+func (bb *blueBubbles) markRetractionInflight(guid string) {
+	if guid == "" {
+		return
+	}
+	bb.editedLock.Lock()
+	if bb.inflightRetractions == nil {
+		bb.inflightRetractions = make(map[string]struct{})
+	}
+	bb.inflightRetractions[guid] = struct{}{}
+	bb.editedLock.Unlock()
 }
 
 func (bb *blueBubbles) markEdited(guid string, dateEdited int64) {
@@ -1164,8 +1221,10 @@ func (bb *blueBubbles) handleNewMessage(rawMessage json.RawMessage) (err error) 
 
 	select {
 	case bb.messageChan <- message:
-		if data.DateEdited != 0 {
-			bb.markEdited(data.GUID, data.DateEdited)
+		if data.DateRetracted != 0 {
+			bb.markRetractionInflight(data.GUID)
+		} else if data.DateEdited != 0 {
+			bb.markEditInflight(data.GUID, data.DateEdited)
 		}
 	default:
 		message.CleanupTempAttachments()
@@ -1261,9 +1320,10 @@ func (bb *blueBubbles) handleMessageUpdated(rawMessage json.RawMessage) (err err
 		}
 	}
 
-	// Only download attachments when forwarding a genuine new edit; delivery/read/retract
-	// updates and suppressed echoes do not need media fetched to disk.
-	downloadAttachments := isNewEdit && !isRetracted
+	// Only download attachments when forwarding a genuine new edit that may re-upload
+	// a single combined attachment+caption; delivery/read/retract updates, suppressed
+	// echoes, and caption-only edits do not need media fetched to disk.
+	downloadAttachments := isNewEdit && !isRetracted && bb.shouldDownloadEditAttachments(len(data.Attachments))
 	message, err := bb.convertBBMessageToiMessageWithOptions(data, downloadAttachments)
 	if err != nil {
 		bb.log.Warn().Err(err).RawJSON("rawMessage", rawMessage).Str("event", "handleMessageUpdated").Msg("Failed to convert message data")
@@ -1273,8 +1333,10 @@ func (bb *blueBubbles) handleMessageUpdated(rawMessage json.RawMessage) (err err
 	if isNewEdit || message.IsRetracted {
 		select {
 		case bb.messageChan <- message:
-			if isNewEdit {
-				bb.markEdited(data.GUID, data.DateEdited)
+			if message.IsRetracted {
+				bb.markRetractionInflight(data.GUID)
+			} else if isNewEdit {
+				bb.markEditInflight(data.GUID, data.DateEdited)
 			}
 		default:
 			message.CleanupTempAttachments()
@@ -1668,6 +1730,20 @@ func (bb *blueBubbles) getMessage(guid string) (*Message, error) {
 	return &messageResponse.Data, nil
 }
 
+func (bb *blueBubbles) getMessageWithDetails(guid string) (*Message, error) {
+	bb.log.Trace().Str("guid", guid).Msg("getMessageWithDetails")
+
+	var messageResponse MessageResponse
+	err := bb.apiGet(fmt.Sprintf("/api/v1/message/%s", guid), map[string]string{
+		"with": "chats,attachment,handle,message.attributedBody,message.messageSummaryInfo,message.payloadData",
+	}, &messageResponse)
+	if err != nil {
+		return nil, err
+	}
+
+	return &messageResponse.Data, nil
+}
+
 func (bb *blueBubbles) GetMessage(guid string) (resp *imessage.Message, err error) {
 	bb.log.Trace().Str("guid", guid).Msg("GetMessage")
 
@@ -1691,7 +1767,11 @@ func (bb *blueBubbles) GetMessage(guid string) (resp *imessage.Message, err erro
 }
 
 func (bb *blueBubbles) queryChats(query ChatQueryRequest, allResults []Chat) ([]Chat, error) {
-	bb.log.Info().Interface("query", query).Msg("queryChatMessages")
+	return bb.queryChatsWithStop(query, allResults, 0)
+}
+
+func (bb *blueBubbles) queryChatsWithStop(query ChatQueryRequest, allResults []Chat, stopBeforeCreatedMs int64) ([]Chat, error) {
+	bb.log.Debug().Interface("query", query).Msg("queryChats")
 
 	var resp ChatQueryResponse
 	err := bb.apiPost("/api/v1/chat/query", query, &resp)
@@ -1701,11 +1781,22 @@ func (bb *blueBubbles) queryChats(query ChatQueryRequest, allResults []Chat) ([]
 
 	allResults = append(allResults, resp.Data...)
 
+	if len(resp.Data) == 0 || resp.Metadata.Limit <= 0 {
+		return allResults, nil
+	}
+
+	if stopBeforeCreatedMs > 0 && query.Sort == QuerySortLastMessage {
+		lastChat := resp.Data[len(resp.Data)-1]
+		if lastChat.LastMessage == nil || lastChat.LastMessage.DateCreated < stopBeforeCreatedMs {
+			return allResults, nil
+		}
+	}
+
 	nextPageOffset := resp.Metadata.Offset + resp.Metadata.Limit
 	if nextPageOffset < resp.Metadata.Total {
 		query.Offset = nextPageOffset
 		query.Limit = resp.Metadata.Limit
-		return bb.queryChats(query, allResults)
+		return bb.queryChatsWithStop(query, allResults, stopBeforeCreatedMs)
 	}
 
 	return allResults, nil
@@ -1724,7 +1815,7 @@ func (bb *blueBubbles) GetChatsWithMessagesAfter(minDate time.Time) (resp []imes
 		Sort: QuerySortLastMessage,
 	}
 
-	chats, err := bb.queryChats(request, []Chat{})
+	chats, err := bb.queryChatsWithStop(request, []Chat{}, minDate.UnixMilli())
 	if err != nil {
 		bb.log.Error().Err(err).Time("minDate", minDate).Str("search", "GetChatsWithMessagesAfter").Msg("Failed to search for chats")
 		return nil, err
@@ -2416,6 +2507,12 @@ func (bb *blueBubbles) ResolveIdentifier(address string) (string, error) {
 	if err != nil {
 		var statusErr *HTTPStatusError
 		if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
+			// BlueBubbles only records handles in chat.db after at least one message has been
+			// exchanged, so first-contact DMs return HTTP 404. Reuse any cached service first,
+			// otherwise default to iMessage so starting a brand-new DM is possible.
+			if cachedSvc := bb.getResolvedHandleService(handle); cachedSvc != "" {
+				return cachedSvc + ";-;" + handle, nil
+			}
 			bb.log.Debug().Str("address", address).Str("handle", handle).Msg("Handle not found in BlueBubbles (404); assuming 'iMessage' service")
 			return "iMessage;-;" + handle, nil
 		}
@@ -3490,6 +3587,33 @@ func numericOnly(s string) string {
 // These functions are probably not necessary
 
 func (bb *blueBubbles) SendMessageBridgeResult(chatID, messageID string, eventID id.EventID, success bool) {
+	if messageID == "" {
+		return
+	}
+	bb.editedLock.Lock()
+	editTS, hasEdit := bb.inflightEdits[messageID]
+	if hasEdit {
+		delete(bb.inflightEdits, messageID)
+	}
+	_, hasRetraction := bb.inflightRetractions[messageID]
+	if hasRetraction {
+		delete(bb.inflightRetractions, messageID)
+	}
+	if success && hasRetraction {
+		delete(bb.lastEdited, messageID)
+	}
+	bb.editedLock.Unlock()
+
+	if !success {
+		return
+	}
+	if hasRetraction {
+		bb.deletePersistedEditTS(messageID)
+		return
+	}
+	if hasEdit {
+		bb.markEdited(messageID, editTS)
+	}
 }
 func (bb *blueBubbles) SendBackfillResult(chatID, backfillID string, success bool, idMap map[string][]id.EventID) {
 }

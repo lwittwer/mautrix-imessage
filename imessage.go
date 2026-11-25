@@ -185,6 +185,11 @@ func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
 		),
 		msg.ThreadID,
 	)
+	if len(portal.MXID) == 0 && !portal.Identifier.IsGroup && portal.Identifier.Service == "any" {
+		if bound := imh.bridge.bindExistingDMPortal(msg.ChatGUID, msg.Service); bound != nil {
+			portal = bound
+		}
+	}
 	if msg.ThreadID != "" && msg.ThreadID != portal.ThreadID {
 		portal.log.Infoln("Found portal thread ID in message: %s (prev: %s)", msg.ThreadID, portal.ThreadID)
 		portal.ThreadID = msg.ThreadID

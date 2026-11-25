@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -439,6 +440,8 @@ type fakeTestIMAPI struct {
 	lastSendFileMime  string
 	lastSendFileVoice bool
 	sendFileCalled    bool
+	lastSendMsgChatID string
+	lastSendMsgText   string
 }
 
 func (f *fakeTestIMAPI) Capabilities() imessage.ConnectorCapabilities {
@@ -459,6 +462,12 @@ func (f *fakeTestIMAPI) SendBackfillResult(chatID, backfillID string, success bo
 }
 
 func (f *fakeTestIMAPI) SendMessageBridgeResult(chatID, messageID string, eventID id.EventID, success bool) {
+}
+
+func (f *fakeTestIMAPI) SendMessage(chatID, text string, replyTo string, replyToPart int, richLink *imessage.RichLink, metadata imessage.MessageMetadata) (*imessage.SendResponse, error) {
+	f.lastSendMsgChatID = chatID
+	f.lastSendMsgText = text
+	return &imessage.SendResponse{GUID: "out-msg-1", Service: "iMessage", ChatGUID: chatID, Time: time.Now()}, nil
 }
 
 func (f *fakeTestIMAPI) SendFile(chatID, text, filename string, pathOnDisk string, replyTo string, replyToPart int, mimeType string, voiceMemo bool, metadata imessage.MessageMetadata) (*imessage.SendResponse, error) {
@@ -484,16 +493,69 @@ func TestStartChatReusesExistingRoomWhenResolveReturnsAny(t *testing.T) {
 		t.Fatalf("database upgrade failed: %v", err)
 	}
 
-	zlog := zerolog.Nop()
-	br := &IMBridge{
-		DB:            db,
-		Config:        &config.Config{BaseConfig: &bridgeconfig.BaseConfig{}},
-		portalsByGUID: make(map[string]*Portal),
-		portalsByMXID: make(map[id.RoomID]*Portal),
-		IM:            &fakeTestIMAPI{resolvedGUID: "any;-;+15551234567"},
+	var sentMatrixRoom id.RoomID
+	mxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/send/m.room.message/") {
+			// Path: /_matrix/client/v3/rooms/<roomID>/send/m.room.message/<txn>
+			parts := strings.Split(r.URL.Path, "/")
+			for i, p := range parts {
+				if p == "rooms" && i+1 < len(parts) {
+					sentMatrixRoom = id.RoomID(parts[i+1])
+					break
+				}
+			}
+			_, _ = w.Write([]byte(`{"event_id":"$in-evt-1"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer mxSrv.Close()
+
+	makeTestIntent := func(mxid id.UserID, serverURL string) *appservice.IntentAPI {
+		as := appservice.Create()
+		as.HomeserverDomain = "example.com"
+		as.Registration = &appservice.Registration{AppToken: "token"}
+		client, err := mautrix.NewClient(serverURL, mxid, "token")
+		if err != nil {
+			t.Fatal(err)
+		}
+		intent := as.NewIntentAPI(mxid.Localpart())
+		intent.Client = client
+		intent.UserID = mxid
+		intent.IsCustomPuppet = true
+		as.StateStore.MarkRegistered(mxid)
+		as.StateStore.SetMembership("!original-room:example.com", mxid, event.MembershipJoin)
+		return intent
 	}
-	br.Log = log.DefaultLogger
-	br.ZLog = &zlog
+
+	puppetIntent := makeTestIntent("@imessage_15551234567:example.com", mxSrv.URL)
+	botIntent := makeTestIntent("@bot:example.com", mxSrv.URL)
+
+	fakeIM := &fakeTestIMAPI{resolvedGUID: "any;-;+15551234567"}
+	newBridge := func() *IMBridge {
+		zlog := zerolog.Nop()
+		b := &IMBridge{
+			DB:            db,
+			Config:        &config.Config{BaseConfig: &bridgeconfig.BaseConfig{}},
+			portalsByGUID: make(map[string]*Portal),
+			portalsByMXID: make(map[id.RoomID]*Portal),
+			puppets:       make(map[string]*Puppet),
+			user:          &User{User: &database.User{MXID: "@me:example.com"}},
+			IM:            fakeIM,
+		}
+		b.Log = log.DefaultLogger
+		b.ZLog = &zlog
+		b.Bot = botIntent
+		b.puppets["+15551234567"] = &Puppet{
+			Puppet: &database.Puppet{ID: "+15551234567", Displayname: "Alice"},
+			bridge: b,
+			MXID:   "@imessage_15551234567:example.com",
+			Intent: puppetIntent,
+		}
+		return b
+	}
+
+	br := newBridge()
 
 	// Pre-existing iMessage;-; portal with a Matrix room (pre-Sequoia migration state)
 	dbPortal := db.Portal.New()
@@ -509,8 +571,53 @@ func TestStartChatReusesExistingRoomWhenResolveReturnsAny(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartChat failed: %v", err)
 	}
-	if resp.RoomID != "!original-room:example.com" || resp.GUID != "iMessage;-;+15551234567" || resp.JustCreated {
-		t.Fatalf("expected StartChat to reuse original room without creating a new one, got %+v", resp)
+	if resp.RoomID != "!original-room:example.com" || resp.GUID != "any;-;+15551234567" || resp.JustCreated {
+		t.Fatalf("expected StartChat to reuse original room and bind to any;-;+15551234567, got %+v", resp)
+	}
+
+	// Simulate restart: reload bridge from SQLite and verify BOTH inbound any;-; message
+	// and outbound Matrix reply use the original Matrix room and current BlueBubbles chat.
+	brReloaded := newBridge()
+	inboundPortal := brReloaded.GetPortalByGUID("any;-;+15551234567")
+	if inboundPortal.MXID != "!original-room:example.com" {
+		t.Fatalf("expected persisted any;-; portal to resolve to original room, got %q", inboundPortal.MXID)
+	}
+	if legacyAlias := brReloaded.GetPortalByGUID("iMessage;-;+15551234567"); legacyAlias.MXID != "!original-room:example.com" {
+		t.Fatalf("expected legacy iMessage;-; alias to also resolve to original room, got %q", legacyAlias.MXID)
+	}
+
+	// Inbound message on any;-; lands in the original Matrix room
+	inboundPortal.HandleiMessage(&imessage.Message{
+		GUID:     "in-any-1",
+		ChatGUID: "any;-;+15551234567",
+		Service:  "iMessage",
+		Sender:   imessage.Identifier{LocalID: "+15551234567", Service: "iMessage"},
+		Text:     "hello after sequoia upgrade",
+		Time:     time.Now(),
+	})
+	if sentMatrixRoom != "!original-room:example.com" {
+		t.Fatalf("expected inbound message to be sent to !original-room:example.com, got %q", sentMatrixRoom)
+	}
+
+	// Outbound Matrix reply in the original room sends to the current BlueBubbles any;-; chat
+	outboundPortal := brReloaded.GetPortalByMXID("!original-room:example.com")
+	if outboundPortal == nil {
+		t.Fatal("expected GetPortalByMXID to return original room portal")
+	}
+	outboundPortal.HandleMatrixMessage(&event.Event{
+		ID:        "$out-evt-1",
+		Sender:    "@me:example.com",
+		Timestamp: time.Now().UnixMilli(),
+		Type:      event.EventMessage,
+		Content: event.Content{
+			Parsed: &event.MessageEventContent{
+				MsgType: event.MsgText,
+				Body:    "reply from matrix",
+			},
+		},
+	})
+	if fakeIM.lastSendMsgChatID != "any;-;+15551234567" || fakeIM.lastSendMsgText != "reply from matrix" {
+		t.Fatalf("expected outbound reply to target any;-;+15551234567, got chat=%q text=%q", fakeIM.lastSendMsgChatID, fakeIM.lastSendMsgText)
 	}
 }
 
@@ -712,5 +819,80 @@ func TestForwardBackfillAndHandleiMessageCleanUpTempAttachments(t *testing.T) {
 	})
 	if _, err := os.Stat(timeoutTemp); !os.IsNotExist(err) {
 		t.Fatalf("expected HandleiMessage timeout-dedup temp attachment to be deleted, stat err=%v", err)
+	}
+
+	// 4. Expired timeout-dedup entry must NOT match a later message with the same text.
+	portal.messageDedup = map[string]SentMessage{
+		"hello again": {
+			EventID:   "$old-timeout-evt",
+			Timestamp: time.Now().Add(-10 * time.Minute),
+			ExpiresAt: time.Now().Add(-1 * time.Minute),
+		},
+	}
+	if portal.isDuplicate(db.Message.New(), &imessage.Message{GUID: "later-msg", Text: "hello again", Time: time.Now()}) {
+		t.Fatal("expected expired timeout dedup entry not to match later message")
+	}
+}
+
+func TestNoteMessageServiceUpdatesGroupPowerLevelsImmediately(t *testing.T) {
+	var setPLCalled bool
+	var gotInvite, gotKick int
+	mxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/state/m.room.power_levels"):
+			_, _ = w.Write([]byte(`{"invite":99,"kick":99,"users":{"@bot:example.com":100}}`))
+		case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/state/m.room.power_levels"):
+			setPLCalled = true
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if v, ok := body["invite"].(float64); ok {
+				gotInvite = int(v)
+			}
+			if v, ok := body["kick"].(float64); ok {
+				gotKick = int(v)
+			}
+			_, _ = w.Write([]byte(`{"event_id":"$pl-evt"}`))
+		default:
+			_, _ = w.Write([]byte(`{"event_id":"$state-evt"}`))
+		}
+	}))
+	defer mxSrv.Close()
+
+	as := appservice.Create()
+	as.HomeserverDomain = "example.com"
+	as.Registration = &appservice.Registration{AppToken: "token"}
+	as.StateStore.MarkRegistered("@bot:example.com")
+	as.StateStore.SetMembership("!grp:example.com", "@bot:example.com", event.MembershipJoin)
+	botClient, err := mautrix.NewClient(mxSrv.URL, "@bot:example.com", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	botIntent := as.NewIntentAPI("bot")
+	botIntent.Client = botClient
+	botIntent.UserID = "@bot:example.com"
+	botIntent.IsCustomPuppet = true
+
+	zlog := zerolog.Nop()
+	br := &IMBridge{
+		Config: &config.Config{BaseConfig: &bridgeconfig.BaseConfig{}},
+		user:   &User{User: &database.User{MXID: "@alice:example.com"}},
+		IM:     &fakeGroupAdminAPI{groupAdmin: true},
+	}
+	br.Log = log.DefaultLogger
+	br.ZLog = &zlog
+	br.Bot = botIntent
+
+	portal := &Portal{
+		Portal:        &database.Portal{GUID: "any;+;chat555", MXID: "!grp:example.com"},
+		bridge:        br,
+		log:           log.DefaultLogger,
+		zlog:          zlog,
+		Identifier:    imessage.ParseIdentifier("any;+;chat555"),
+		serviceLoaded: true,
+	}
+
+	portal.noteMessageService("iMessage")
+	if !setPLCalled || gotInvite != 50 || gotKick != 50 {
+		t.Fatalf("expected power levels to update immediately on iMessage confirmation, called=%v invite=%d kick=%d", setPLCalled, gotInvite, gotKick)
 	}
 }

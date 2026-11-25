@@ -77,6 +77,11 @@ type HealthAPI interface {
 type KVStore interface {
 	GetKV(key string) string
 	SetKV(key, value string)
+	DeleteKV(key string)
+}
+
+type CaptionConfig interface {
+	IsCaptionInMessage() bool
 }
 
 type API interface {

@@ -24,12 +24,13 @@ import (
 )
 
 type fakeBridge struct {
-	cfg           *imessage.PlatformConfig
-	zlog          zerolog.Logger
-	mu            sync.Mutex
-	statuses      []imessage.BridgeStatus
-	messagesSince map[string][]string
-	kv            map[string]string
+	cfg              *imessage.PlatformConfig
+	zlog             zerolog.Logger
+	mu               sync.Mutex
+	statuses         []imessage.BridgeStatus
+	messagesSince    map[string][]string
+	kv               map[string]string
+	captionInMessage bool
 }
 
 func newFakeBridge(url, password string) *fakeBridge {
@@ -81,6 +82,14 @@ func (f *fakeBridge) SetKV(key, value string) {
 		f.kv = make(map[string]string)
 	}
 	f.kv[key] = value
+}
+func (f *fakeBridge) DeleteKV(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.kv, key)
+}
+func (f *fakeBridge) IsCaptionInMessage() bool {
+	return f.captionInMessage
 }
 
 func (f *fakeBridge) getStatuses() []imessage.BridgeStatus {
@@ -1836,7 +1845,7 @@ func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Shared bridge with persistent KV store
+	// Shared bridge with persistent KV store (caption_in_message=false -> caption-only edits skip media download)
 	fb := newFakeBridge(srv.URL, "secret-pw")
 	api1, err := NewBlueBubblesConnector(fb)
 	if err != nil {
@@ -1850,7 +1859,8 @@ func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
 		"text": "edited once",
 		"dateCreated": 1700000000000,
 		"dateEdited": 1700000005000,
-		"chats": [{"guid": "iMessage;-;+15551234567"}]
+		"chats": [{"guid": "iMessage;-;+15551234567"}],
+		"attachments": [{"guid": "att-1", "transferName": "pic.jpg", "mimeType": "image/jpeg"}]
 	}`)
 	if err := bb1.handleMessageUpdated(initialEdit); err != nil {
 		t.Fatalf("bb1.handleMessageUpdated failed: %v", err)
@@ -1863,13 +1873,56 @@ func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
 	default:
 		t.Fatal("expected initial edit on bb1.MessageChan")
 	}
+	// Caption-only edit (caption_in_message=false) should not download attachments
+	if attachmentCalls.Load() != 0 {
+		t.Fatalf("expected 0 attachment downloads on caption-only edit, got %d", attachmentCalls.Load())
+	}
 
-	// Simulate bridge restart: brand new blueBubbles instance with empty in-memory lastEdited map
+	// Simulate crash/restart BETWEEN enqueue and Matrix delivery (SendMessageBridgeResult never called on bb1):
+	// edit MUST NOT be persisted yet and MUST remain retryable after restart.
+	if gotKV := fb.GetKV(kvEditedPrefix + "msg-persist-1"); gotKV != "" {
+		t.Fatalf("expected edit timestamp not to be persisted before Matrix confirms delivery, got %q", gotKV)
+	}
 	api2, err := NewBlueBubblesConnector(fb)
 	if err != nil {
 		t.Fatal(err)
 	}
 	bb2 := api2.(*blueBubbles)
+	if err := bb2.handleMessageUpdated(initialEdit); err != nil {
+		t.Fatalf("bb2.handleMessageUpdated retry after crash failed: %v", err)
+	}
+	select {
+	case retry := <-bb2.MessageChan():
+		if retry.GUID != "msg-persist-1" || retry.Text != "edited once" {
+			t.Fatalf("unexpected retried edit after crash: %+v", retry)
+		}
+	default:
+		t.Fatal("expected unconfirmed edit to be retried after restart")
+	}
+
+	// Failed Matrix send must clear inflight state so a subsequent retry still works even without restart.
+	bb2.SendMessageBridgeResult("iMessage;-;+15551234567", "msg-persist-1", "", false)
+	if err := bb2.handleMessageUpdated(initialEdit); err != nil {
+		t.Fatalf("bb2.handleMessageUpdated retry after failure failed: %v", err)
+	}
+	select {
+	case <-bb2.MessageChan():
+	default:
+		t.Fatal("expected failed edit to remain retryable")
+	}
+
+	// Once Matrix confirms delivery, the edit timestamp is persisted.
+	bb2.SendMessageBridgeResult("iMessage;-;+15551234567", "msg-persist-1", "$evt1", true)
+	if gotKV := fb.GetKV(kvEditedPrefix + "msg-persist-1"); gotKV != "1700000005000" {
+		t.Fatalf("expected persisted edit timestamp 1700000005000, got %q", gotKV)
+	}
+
+	// Simulate bridge restart AFTER Matrix delivery: brand new blueBubbles instance with empty in-memory map.
+	api3, err := NewBlueBubblesConnector(fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bb3 := api3.(*blueBubbles)
 
 	// Same dateEdited arrives after restart with dateRead and an attachment:
 	// must NOT re-emit duplicate edit, must NOT download attachments, and MUST emit read receipt.
@@ -1883,11 +1936,11 @@ func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
 		"chats": [{"guid": "iMessage;-;+15551234567"}],
 		"attachments": [{"guid": "att-1", "transferName": "pic.jpg", "mimeType": "image/jpeg"}]
 	}`)
-	if err := bb2.handleMessageUpdated(postRestartRead); err != nil {
-		t.Fatalf("bb2.handleMessageUpdated failed: %v", err)
+	if err := bb3.handleMessageUpdated(postRestartRead); err != nil {
+		t.Fatalf("bb3.handleMessageUpdated failed: %v", err)
 	}
 	select {
-	case dup := <-bb2.MessageChan():
+	case dup := <-bb3.MessageChan():
 		t.Fatalf("expected persisted edit to suppress duplicate after restart, got %+v", dup)
 	default:
 	}
@@ -1895,7 +1948,7 @@ func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
 		t.Fatalf("expected 0 attachment downloads on suppressed edit after restart, got %d", attachmentCalls.Load())
 	}
 	select {
-	case rr := <-bb2.ReadReceiptChan():
+	case rr := <-bb3.ReadReceiptChan():
 		if rr.ReadUpTo != "msg-persist-1" {
 			t.Fatalf("unexpected read receipt: %+v", rr)
 		}
@@ -1913,11 +1966,11 @@ func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
 		"dateDelivered": 1700000021000,
 		"chats": [{"guid": "iMessage;-;+15551234567"}]
 	}`)
-	if err := bb2.handleMessageUpdated(newerEditWithDelivered); err != nil {
-		t.Fatalf("bb2.handleMessageUpdated newer edit failed: %v", err)
+	if err := bb3.handleMessageUpdated(newerEditWithDelivered); err != nil {
+		t.Fatalf("bb3.handleMessageUpdated newer edit failed: %v", err)
 	}
 	select {
-	case edited := <-bb2.MessageChan():
+	case edited := <-bb3.MessageChan():
 		if edited.Text != "edited twice" {
 			t.Fatalf("unexpected newer edit: %+v", edited)
 		}
@@ -1925,12 +1978,31 @@ func TestEditedMessagePersistsAcrossRestartAndPreservesReceipts(t *testing.T) {
 		t.Fatal("expected newer edit to reach MessageChan")
 	}
 	select {
-	case st := <-bb2.MessageStatusChan():
+	case st := <-bb3.MessageStatusChan():
 		if st.GUID != "msg-persist-1" || st.Status != "delivered" {
 			t.Fatalf("unexpected delivery status: %+v", st)
 		}
 	default:
 		t.Fatal("expected delivered status to also be forwarded alongside new edit")
+	}
+	bb3.SendMessageBridgeResult("iMessage;-;+15551234567", "msg-persist-1", "$evt2", true)
+
+	// Confirming a retraction cleans up the persisted bb_edit:<guid> KV row.
+	retractUpdate := json.RawMessage(`{
+		"guid": "msg-persist-1",
+		"isFromMe": true,
+		"dateCreated": 1700000000000,
+		"dateEdited": 1700000020000,
+		"dateRetracted": 1700000030000,
+		"chats": [{"guid": "iMessage;-;+15551234567"}]
+	}`)
+	if err := bb3.handleMessageUpdated(retractUpdate); err != nil {
+		t.Fatalf("bb3.handleMessageUpdated retract failed: %v", err)
+	}
+	<-bb3.MessageChan()
+	bb3.SendMessageBridgeResult("iMessage;-;+15551234567", "msg-persist-1", "$evt1", true)
+	if gotKV := fb.GetKV(kvEditedPrefix + "msg-persist-1"); gotKV != "" {
+		t.Fatalf("expected persisted edit KV row to be deleted on retraction, got %q", gotKV)
 	}
 }
 
@@ -1976,5 +2048,78 @@ func TestHealthAndAnyChatLookupDoNotBlockOnRequestLock(t *testing.T) {
 	case <-done:
 	case <-time.After(1 * time.Second):
 		t.Fatal("GetHealth or lookupExistingAnyChat blocked on bbRequestLock")
+	}
+}
+
+func TestQueryChatsPaginationGuardAndFullPreLookbackFetch(t *testing.T) {
+	now := time.Now()
+	since := now.Add(-1 * time.Minute)
+	twoHoursAgoMs := now.Add(-2 * time.Hour).UnixMilli()
+	editedNowMs := now.Add(-10 * time.Second).UnixMilli()
+
+	var chatQueryCalls atomic.Int32
+	var fullMsgFetched atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/chat/query":
+			if chatQueryCalls.Add(1) > 1 {
+				t.Error("queryChats should not paginate infinitely when Limit=0")
+				http.Error(w, "loop", http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(ChatQueryResponse{
+				Status: 200,
+				Data: []Chat{
+					{
+						GUID: "iMessage;-;+15554445555",
+						// Deliberately omit Handle on LastMessage to confirm full message lookup runs.
+						LastMessage: &Message{
+							GUID:        "old-edited-last",
+							DateCreated: twoHoursAgoMs,
+							DateEdited:  editedNowMs,
+							Text:        "partial",
+						},
+					},
+				},
+				Metadata: PageMetadata{Total: 50, Limit: 0, Offset: 0, Count: 1},
+			})
+		case "/api/v1/chat/iMessage;-;+15554445555/message":
+			_ = json.NewEncoder(w).Encode(MessageQueryResponse{
+				Status:   200,
+				Data:     []Message{},
+				Metadata: PageMetadata{Total: 0, Limit: 100, Offset: 0, Count: 0},
+			})
+		case "/api/v1/message/old-edited-last":
+			fullMsgFetched.Store(true)
+			_ = json.NewEncoder(w).Encode(MessageResponse{
+				Status: 200,
+				Data: Message{
+					GUID:        "old-edited-last",
+					DateCreated: twoHoursAgoMs,
+					DateEdited:  editedNowMs,
+					Text:        "full edited text",
+					Handle:      Handle{Address: "+15554445555", Service: "iMessage"},
+					Chats:       []Chat{{GUID: "iMessage;-;+15554445555"}},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+	bb.runReconnectCatchUp(since)
+
+	if !fullMsgFetched.Load() {
+		t.Fatal("expected catch-up to fetch full message details for pre-lookback edited LastMessage")
+	}
+	select {
+	case msg := <-bb.MessageChan():
+		if msg.GUID != "old-edited-last" || msg.Text != "full edited text" || msg.Sender.LocalID != "+15554445555" {
+			t.Fatalf("unexpected hydrated pre-lookback edited message: %+v", msg)
+		}
+	default:
+		t.Fatal("expected hydrated pre-lookback edit on MessageChan")
 	}
 }

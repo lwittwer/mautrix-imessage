@@ -139,16 +139,97 @@ func (portal *Portal) reIDInto(newGUID string, newPortal *Portal, lock, mergeExi
 	}
 
 	portal.log.Infoln("Changing chat ID to", newGUID)
-	delete(br.portalsByGUID, portal.GUID)
+	oldGUID := portal.GUID
+	oldService := portal.Identifier.Service
+	delete(br.portalsByGUID, oldGUID)
 	portal.Portal.ReID(newGUID)
 	portal.Identifier = imessage.ParseIdentifier(portal.GUID)
 	portal.log = portal.bridge.Log.Sub(fmt.Sprintf("Portal/%s", portal.GUID))
 	br.portalsByGUID[portal.GUID] = portal
+	if portal.IsPrivateChat() {
+		if br.DB != nil && br.DB.MergedChat != nil {
+			br.DB.MergedChat.Set(nil, portal.GUID, portal.GUID, oldGUID)
+		}
+		br.portalsByGUID[oldGUID] = portal
+		portal.addSecondaryGUIDs([]string{oldGUID})
+	}
+	if portal.Identifier.Service == "any" && oldService != "" && oldService != "any" {
+		portal.serviceLock.Lock()
+		portal.lastSeenService = oldService
+		portal.serviceLoaded = true
+		portal.serviceLock.Unlock()
+		if br.DB != nil && br.DB.KV != nil {
+			br.DB.KV.Set(database.KVPortalServicePrefix+portal.GUID, oldService)
+		}
+	}
 	if len(portal.MXID) > 0 {
 		portal.UpdateBridgeInfo()
 	}
 	portal.log.Debugln("Chat ID changed successfully")
 	return true
+}
+
+// bindExistingDMPortal reuses an existing Matrix DM room across Sequoia "any;-;"
+// and concrete service ("iMessage;-;", "RCS;-;", "SMS;-;") GUIDs, persisting the
+// binding in SQLite so both inbound messages and outbound replies share the same
+// room and current BlueBubbles chat.
+func (br *IMBridge) bindExistingDMPortal(targetGUID, preferredService string) *Portal {
+	parsed := imessage.ParseIdentifier(targetGUID)
+	if parsed.IsGroup || parsed.LocalID == "" {
+		return nil
+	}
+	if existing := br.GetPortalByGUIDIfExists(targetGUID); existing != nil && len(existing.MXID) > 0 {
+		return existing
+	}
+
+	var fallbackServices []string
+	if parsed.Service == "any" {
+		if preferredService != "" && preferredService != "any" {
+			fallbackServices = append(fallbackServices, preferredService)
+		}
+		for _, svc := range []string{"iMessage", "RCS", "SMS"} {
+			if svc != preferredService {
+				fallbackServices = append(fallbackServices, svc)
+			}
+		}
+	} else {
+		fallbackServices = []string{"any"}
+	}
+
+	var candPortal *Portal
+	for _, svc := range fallbackServices {
+		candGUID := imessage.Identifier{Service: svc, LocalID: parsed.LocalID}.String()
+		if p := br.GetPortalByGUIDIfExists(candGUID); p != nil && len(p.MXID) > 0 {
+			candPortal = p
+			break
+		}
+	}
+	if candPortal == nil {
+		return nil
+	}
+
+	if parsed.Service == "any" {
+		// Migrate the existing concrete-service portal to the current "any;-;" GUID
+		// so outbound sends target the active BlueBubbles chat while keeping the old
+		// GUID aliased in merged_chat.
+		if candPortal.reIDInto(targetGUID, nil, true, false) {
+			return candPortal
+		}
+		if rebound := br.GetPortalByGUIDIfExists(targetGUID); rebound != nil && len(rebound.MXID) > 0 {
+			return rebound
+		}
+		return candPortal
+	}
+
+	// Existing portal is already "any;-;"; alias targetGUID -> candPortal.GUID.
+	br.portalsLock.Lock()
+	if br.DB != nil && br.DB.MergedChat != nil {
+		br.DB.MergedChat.Set(nil, candPortal.GUID, targetGUID)
+	}
+	br.portalsByGUID[targetGUID] = candPortal
+	candPortal.addSecondaryGUIDs([]string{targetGUID})
+	br.portalsLock.Unlock()
+	return candPortal
 }
 
 func (br *IMBridge) GetAllPortals() []*Portal {
@@ -223,6 +304,7 @@ func (br *IMBridge) NewPortal(dbPortal *database.Portal) *Portal {
 		if savedSvc := br.DB.KV.Get(database.KVPortalServicePrefix + dbPortal.GUID); savedSvc != "" && savedSvc != "any" {
 			portal.lastSeenService = savedSvc
 		}
+		portal.serviceLoaded = true
 	}
 	if !br.IM.Capabilities().MessageSendResponses {
 		portal.messageDedup = make(map[string]SentMessage)
@@ -231,9 +313,12 @@ func (br *IMBridge) NewPortal(dbPortal *database.Portal) *Portal {
 	return portal
 }
 
+const defaultTimeoutDedupTTL = 5 * time.Minute
+
 type SentMessage struct {
 	EventID   id.EventID
 	Timestamp time.Time
+	ExpiresAt time.Time
 }
 
 type Portal struct {
@@ -263,6 +348,7 @@ type Portal struct {
 	typingLock   sync.Mutex
 
 	lastSeenService string
+	serviceLoaded   bool
 	serviceLock     sync.RWMutex
 }
 
@@ -281,18 +367,21 @@ func (portal *Portal) knownService() string {
 	}
 	portal.serviceLock.RLock()
 	svc := portal.lastSeenService
+	loaded := portal.serviceLoaded
 	portal.serviceLock.RUnlock()
 	if svc != "" && svc != "any" {
 		return svc
 	}
-	if portal.bridge != nil && portal.bridge.DB != nil && portal.bridge.DB.KV != nil {
-		if saved := portal.bridge.DB.KV.Get(database.KVPortalServicePrefix + portal.GUID); saved != "" && saved != "any" {
-			portal.serviceLock.Lock()
-			if portal.lastSeenService == "" {
-				portal.lastSeenService = saved
-			}
-			svc = portal.lastSeenService
-			portal.serviceLock.Unlock()
+	if !loaded && portal.bridge != nil && portal.bridge.DB != nil && portal.bridge.DB.KV != nil {
+		saved := portal.bridge.DB.KV.Get(database.KVPortalServicePrefix + portal.GUID)
+		portal.serviceLock.Lock()
+		if portal.lastSeenService == "" && saved != "" && saved != "any" {
+			portal.lastSeenService = saved
+		}
+		portal.serviceLoaded = true
+		svc = portal.lastSeenService
+		portal.serviceLock.Unlock()
+		if svc != "" && svc != "any" {
 			return svc
 		}
 	}
@@ -315,11 +404,13 @@ func (portal *Portal) noteMessageService(service string) {
 	if portal.Identifier.Service != "any" || service == "" || service == "any" {
 		return
 	}
+	wasManageable := portal.canManageGroup()
 	portal.serviceLock.Lock()
 	changed := portal.lastSeenService != service
 	if changed {
 		portal.lastSeenService = service
 	}
+	portal.serviceLoaded = true
 	portal.serviceLock.Unlock()
 	if changed {
 		if portal.bridge != nil && portal.bridge.DB != nil && portal.bridge.DB.KV != nil {
@@ -328,6 +419,9 @@ func (portal *Portal) noteMessageService(service string) {
 		if len(portal.MXID) > 0 {
 			portal.log.Debugfln("Updated effective service for %s to %s", portal.GUID, service)
 			portal.UpdateBridgeInfo()
+			if !wasManageable && portal.canManageGroup() {
+				portal.syncPowerLevels()
+			}
 		}
 	}
 }
@@ -461,18 +555,7 @@ func (portal *Portal) Sync(backfill bool) {
 
 	portal.ensureUserInvited(portal.bridge.user)
 	portal.addToSpace(portal.bridge.user)
-
-	pls, err := portal.MainIntent().PowerLevels(portal.MXID)
-	if err != nil {
-		portal.zlog.Warn().Err(err).Msg("Failed to get power levels")
-	} else if portal.updatePowerLevels(pls) {
-		resp, err := portal.MainIntent().SetPowerLevels(portal.MXID, pls)
-		if err != nil {
-			portal.zlog.Warn().Err(err).Msg("Failed to update power levels")
-		} else {
-			portal.zlog.Debug().Str("event_id", resp.EventID.String()).Msg("Updated power levels")
-		}
-	}
+	portal.syncPowerLevels()
 
 	if !portal.IsPrivateChat() {
 		chatInfo, err := portal.bridge.IM.GetChatInfo(portal.GUID, portal.ThreadID)
@@ -718,6 +801,27 @@ func (portal *Portal) GetBasePowerLevels() *event.PowerLevelsEventContent {
 	}
 }
 
+func (portal *Portal) syncPowerLevels() {
+	if len(portal.MXID) == 0 {
+		return
+	}
+	intent := portal.MainIntent()
+	if intent == nil || intent.Client == nil {
+		return
+	}
+	pls, err := intent.PowerLevels(portal.MXID)
+	if err != nil {
+		portal.zlog.Warn().Err(err).Msg("Failed to get power levels")
+	} else if portal.updatePowerLevels(pls) {
+		resp, err := intent.SetPowerLevels(portal.MXID, pls)
+		if err != nil {
+			portal.zlog.Warn().Err(err).Msg("Failed to update power levels")
+		} else {
+			portal.zlog.Debug().Str("event_id", resp.EventID.String()).Msg("Updated power levels")
+		}
+	}
+}
+
 func (portal *Portal) updatePowerLevels(pl *event.PowerLevelsEventContent) bool {
 	changed := pl.EnsureUserLevel(portal.bridge.Bot.UserID, 100)
 	if portal.canManageGroup() && portal.bridge.user != nil && portal.bridge.user.MXID != "" {
@@ -805,11 +909,14 @@ func (portal *Portal) UpdateBridgeInfo() {
 		portal.log.Debugln("Not updating bridge info: no Matrix room created")
 		return
 	}
-	portal.log.Debugln("Updating bridge info...")
 	intent := portal.MainIntent()
 	if portal.Encrypted && intent != portal.bridge.Bot && portal.IsPrivateChat() {
 		intent = portal.bridge.Bot
 	}
+	if intent == nil || intent.Client == nil {
+		return
+	}
+	portal.log.Debugln("Updating bridge info...")
 	stateKey, content := portal.getBridgeInfo()
 	_, err := intent.SendStateEvent(portal.MXID, event.StateBridge, stateKey, content)
 	if err != nil {
@@ -1292,13 +1399,20 @@ func (portal *Portal) addTimeoutDedup(eventID id.EventID, key string) {
 	if trimmed == "" {
 		return
 	}
+	now := time.Now()
 	portal.messageDedupLock.Lock()
 	if portal.messageDedup == nil {
 		portal.messageDedup = make(map[string]SentMessage)
 	}
+	for k, entry := range portal.messageDedup {
+		if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
+			delete(portal.messageDedup, k)
+		}
+	}
 	portal.messageDedup[trimmed] = SentMessage{
 		EventID:   eventID,
-		Timestamp: time.Now().Add(-10 * time.Second),
+		Timestamp: now.Add(-10 * time.Second),
+		ExpiresAt: now.Add(defaultTimeoutDedupTTL),
 	}
 	portal.messageDedupLock.Unlock()
 }
@@ -1430,7 +1544,8 @@ func (portal *Portal) HandleMatrixMessage(evt *event.Event) {
 			certain = false
 			statusCode = status.MsgStatusTimeout
 			humanReadable = "Timed out waiting for remote server response; message may still be delivered"
-			if !wasEdit {
+			_, isVoice := evt.Content.Raw["org.matrix.msc3245.voice"]
+			if !wasEdit && !isVoice {
 				dedupKey := msg.Body
 				if msg.FileName != "" {
 					dedupKey = msg.FileName
@@ -1884,6 +1999,9 @@ func (portal *Portal) isDuplicate(dbMessage *database.Message, msg *imessage.Mes
 	if isDup {
 		delete(portal.messageDedup, trimmedKey)
 		portal.messageDedupLock.Unlock()
+		if !dedup.ExpiresAt.IsZero() && time.Now().After(dedup.ExpiresAt) {
+			return false
+		}
 		portal.log.Debugfln("Received echo for Matrix message %s -> %s", dedup.EventID, msg.GUID)
 		if !dedup.Timestamp.Before(msg.Time) {
 			portal.log.Warnfln("Echo for Matrix message %s has lower timestamp than expected (message: %d, expected: %d)", dedup.EventID, msg.Time.Unix(), dedup.Timestamp.Unix())
@@ -2257,7 +2375,7 @@ func (portal *Portal) convertEditediMessage(msg *imessage.Message, dbMessage *da
 	return nil
 }
 
-func (portal *Portal) handleNormaliMessage(msg *imessage.Message, dbMessage *database.Message, intent *appservice.IntentAPI, mxid *id.EventID) {
+func (portal *Portal) handleNormaliMessage(msg *imessage.Message, dbMessage *database.Message, intent *appservice.IntentAPI, mxid *id.EventID) bool {
 	if msg.Metadata != nil && portal.bridge.Config.HackyStartupTest.Key != "" {
 		if portal.bridge.Config.HackyStartupTest.EchoMode {
 			_, ok := msg.Metadata[startupTestKey].(map[string]any)
@@ -2282,12 +2400,14 @@ func (portal *Portal) handleNormaliMessage(msg *imessage.Message, dbMessage *dat
 		if mxid == nil {
 			portal.log.Warnfln("iMessage %s doesn't contain any attachments nor text", msg.GUID)
 		}
-		return
+		return false
 	}
+	allSucceeded := true
 	for index, converted := range parts {
 		portal.log.Debugfln("Sending iMessage attachment %s.%d", msg.GUID, index)
 		resp, err := portal.sendMessage(intent, converted.Type, converted.Content, converted.Extra, dbMessage.Timestamp)
 		if err != nil {
+			allSucceeded = false
 			portal.log.Errorfln("Failed to send attachment %s.%d: %v", msg.GUID, index, err)
 		} else {
 			portal.log.Debugfln("Handled iMessage attachment %s.%d -> %s", msg.GUID, index, resp.EventID)
@@ -2299,6 +2419,7 @@ func (portal *Portal) handleNormaliMessage(msg *imessage.Message, dbMessage *dat
 			}
 		}
 	}
+	return allSucceeded
 }
 
 func (portal *Portal) handleIMError(msg *imessage.Message, dbMessage *database.Message, intent *appservice.IntentAPI) {
@@ -2357,18 +2478,25 @@ func (portal *Portal) HandleiMessage(msg *imessage.Message) id.EventID {
 	defer msg.CleanupTempAttachments()
 
 	var dbMessage *database.Message
-	var overrideSuccess bool
+	var bridgeSuccess bool
+	var explicitResult bool
 
 	defer func() {
 		if err := recover(); err != nil {
 			portal.log.Errorfln("Panic while handling %s: %v\n%s", msg.GUID, err, string(debug.Stack()))
+			explicitResult = true
+			bridgeSuccess = false
 		}
 		hasMXID := dbMessage != nil && len(dbMessage.MXID) > 0
 		var eventID id.EventID
 		if hasMXID {
 			eventID = dbMessage.MXID
 		}
-		portal.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, eventID, overrideSuccess || hasMXID)
+		success := hasMXID
+		if explicitResult {
+			success = bridgeSuccess
+		}
+		portal.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, eventID, success)
 	}()
 
 	// Look up the message in the database
@@ -2391,6 +2519,7 @@ func (portal *Portal) HandleiMessage(msg *imessage.Message) id.EventID {
 	// If the message exists in the database, handle edits or retractions
 	if dbMessage != nil && dbMessage.MXID != "" {
 		// DEVNOTE: It seems sometimes the message is just edited to remove data instead of actually retracting it
+		explicitResult = true
 
 		if msg.IsRetracted ||
 			(len(msg.Attachments) == 0 && len(msg.Text) == 0 && len(msg.Subject) == 0) {
@@ -2398,33 +2527,30 @@ func (portal *Portal) HandleiMessage(msg *imessage.Message) id.EventID {
 			// Retract existing message
 			if portal.HandleMessageRevoke(*msg) {
 				portal.zlog.Debug().Str("messageGUID", msg.GUID).Str("chatGUID", msg.ChatGUID).Msg("Revoked message")
+				bridgeSuccess = true
 			} else {
 				portal.zlog.Warn().Str("messageGUID", msg.GUID).Str("chatGUID", msg.ChatGUID).Msg("Failed to revoke message")
 			}
-
-			overrideSuccess = true
 		} else if msg.IsEdited {
 
 			// Edit existing message
 			intent := portal.getIntentForMessage(msg, nil)
 			if intent != nil {
-				portal.handleNormaliMessage(msg, dbMessage, intent, &dbMessage.MXID)
+				bridgeSuccess = portal.handleNormaliMessage(msg, dbMessage, intent, &dbMessage.MXID)
 			}
-
-			overrideSuccess = true
 		} else if msg.IsRead && msg.IsFromMe {
 
 			// Send read receipt
 			err := portal.markRead(portal.MainIntent(), dbMessage.MXID, msg.ReadAt)
 			if err != nil {
 				portal.log.Warnfln("Failed to send read receipt for %s: %v", dbMessage.MXID, err)
+			} else {
+				bridgeSuccess = true
 			}
-
-			overrideSuccess = true
 		} else {
 			portal.log.Debugln("Ignoring duplicate message", msg.GUID)
 			// Send a success confirmation since it's a duplicate message
-			overrideSuccess = true
+			bridgeSuccess = true
 		}
 		return ""
 	}
