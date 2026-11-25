@@ -29,6 +29,10 @@ import (
 type KeyValueQuery struct {
 	db  *Database
 	log log.Logger
+
+	// beforeDeleteHook is an optional test hook invoked after scanning expired
+	// keys and before executing the compare-and-delete batches.
+	beforeDeleteHook func()
 }
 
 const (
@@ -85,7 +89,11 @@ func (kvq *KeyValueQuery) DeletePrefixOlderThan(prefix string, cutoff int64) (in
 		return 0, fmt.Errorf("failed to query kv_store for prefix %s: %w", prefix, err)
 	}
 
-	var expiredKeys []string
+	type expiredEntry struct {
+		key   string
+		value string
+	}
+	var expired []expiredEntry
 	for rows.Next() {
 		var key, raw string
 		if err := rows.Scan(&key, &raw); err != nil {
@@ -100,7 +108,7 @@ func (kvq *KeyValueQuery) DeletePrefixOlderThan(prefix string, cutoff int64) (in
 			continue
 		}
 		if ts < cutoff {
-			expiredKeys = append(expiredKeys, key)
+			expired = append(expired, expiredEntry{key: key, value: raw})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -109,26 +117,30 @@ func (kvq *KeyValueQuery) DeletePrefixOlderThan(prefix string, cutoff int64) (in
 	}
 	_ = rows.Close()
 
-	if len(expiredKeys) == 0 {
+	if len(expired) == 0 {
 		return 0, nil
 	}
 
-	const batchSize = 200
+	if kvq.beforeDeleteHook != nil {
+		kvq.beforeDeleteHook()
+	}
+
+	const batchSize = 100
 	var deleted int64
-	for start := 0; start < len(expiredKeys); start += batchSize {
+	for start := 0; start < len(expired); start += batchSize {
 		end := start + batchSize
-		if end > len(expiredKeys) {
-			end = len(expiredKeys)
+		if end > len(expired) {
+			end = len(expired)
 		}
-		batch := expiredKeys[start:end]
-		placeholders := make([]string, len(batch))
-		args := make([]any, len(batch))
-		for i, key := range batch {
-			placeholders[i] = fmt.Sprintf("$%d", i+1)
-			args[i] = key
+		batch := expired[start:end]
+		conditions := make([]string, len(batch))
+		args := make([]any, 0, len(batch)*2)
+		for i, entry := range batch {
+			conditions[i] = fmt.Sprintf("(key=$%d AND value=$%d)", i*2+1, i*2+2)
+			args = append(args, entry.key, entry.value)
 		}
 		res, execErr := kvq.db.Exec(
-			fmt.Sprintf("DELETE FROM kv_store WHERE key IN (%s)", strings.Join(placeholders, ", ")),
+			fmt.Sprintf("DELETE FROM kv_store WHERE %s", strings.Join(conditions, " OR ")),
 			args...,
 		)
 		if execErr != nil {

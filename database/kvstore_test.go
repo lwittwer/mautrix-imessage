@@ -74,6 +74,43 @@ func TestKVDeletePrefixOlderThan(t *testing.T) {
 	}
 }
 
+func TestKVDeletePrefixOlderThanPreservesRefreshedRow(t *testing.T) {
+	rawDB, err := dbutil.NewWithDialect("file:kv_prune_refresh_race_test?mode=memory&cache=shared&_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	defer rawDB.Close()
+
+	db := New(rawDB, log.DefaultLogger)
+	if err := db.Upgrade(); err != nil {
+		t.Fatalf("database upgrade failed: %v", err)
+	}
+
+	db.KV.Set("bb_edit:refreshed", "1000")
+	db.KV.Set("bb_edit:still-expired", "1000")
+
+	// Simulate a writer refreshing bb_edit:refreshed between the scan closing
+	// and the compare-and-delete batch executing.
+	db.KV.beforeDeleteHook = func() {
+		db.KV.Set("bb_edit:refreshed", "5000")
+	}
+	defer func() { db.KV.beforeDeleteHook = nil }()
+
+	deleted, err := db.KV.DeletePrefixOlderThan("bb_edit:", 2000)
+	if err != nil {
+		t.Fatalf("DeletePrefixOlderThan failed: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected only 1 unrefreshed row deleted, got %d", deleted)
+	}
+	if got := db.KV.Get("bb_edit:refreshed"); got != "5000" {
+		t.Fatalf("expected refreshed row to survive with value 5000, got %q", got)
+	}
+	if got := db.KV.Get("bb_edit:still-expired"); got != "" {
+		t.Fatalf("expected unrefreshed expired row to be deleted, got %q", got)
+	}
+}
+
 type kvRecDriver struct {
 	mu      sync.Mutex
 	queries []string
@@ -98,7 +135,7 @@ func (c *kvRecConn) ExecContext(_ context.Context, query string, args []driver.N
 	c.drv.mu.Lock()
 	c.drv.queries = append(c.drv.queries, query)
 	c.drv.mu.Unlock()
-	return driver.RowsAffected(len(args)), nil
+	return driver.RowsAffected(len(args) / 2), nil
 }
 
 type kvRecRows struct {
@@ -170,7 +207,8 @@ func TestKVDeletePrefixOlderThanUsesPostgresPlaceholders(t *testing.T) {
 	if !strings.Contains(kvRecDrv.queries[0], "$1") {
 		t.Fatalf("expected $1 placeholder in SELECT query: %s", kvRecDrv.queries[0])
 	}
-	if !strings.Contains(kvRecDrv.queries[1], "$1") || !strings.Contains(kvRecDrv.queries[1], "$2") {
-		t.Fatalf("expected $1, $2 placeholders in DELETE query: %s", kvRecDrv.queries[1])
+	if !strings.Contains(kvRecDrv.queries[1], "$1") || !strings.Contains(kvRecDrv.queries[1], "$2") ||
+		!strings.Contains(kvRecDrv.queries[1], "$3") || !strings.Contains(kvRecDrv.queries[1], "$4") {
+		t.Fatalf("expected key/value placeholders $1..$4 in DELETE query: %s", kvRecDrv.queries[1])
 	}
 }

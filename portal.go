@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gabriel-vasile/mimetype"
@@ -147,8 +148,11 @@ func (portal *Portal) reIDInto(newGUID string, newPortal *Portal, lock, mergeExi
 	portal.log.Infoln("Changing chat ID to", newGUID)
 	oldGUID := portal.GUID
 	oldService := portal.Identifier.Service
+	if err := portal.Portal.ReID(newGUID); err != nil {
+		portal.log.Warnfln("Aborting chat ID change %s->%s due to database error: %v", oldGUID, newGUID, err)
+		return false
+	}
 	delete(br.portalsByGUID, oldGUID)
-	portal.Portal.ReID(newGUID)
 	portal.Identifier = imessage.ParseIdentifier(portal.GUID)
 	portal.log = portal.bridge.Log.Sub(fmt.Sprintf("Portal/%s", portal.GUID))
 	br.portalsByGUID[portal.GUID] = portal
@@ -364,9 +368,12 @@ type Portal struct {
 	backfillWait    sync.WaitGroup
 	backfillLock    sync.Mutex
 
-	stop     chan struct{}
-	stopOnce sync.Once
-	loopDone chan struct{}
+	sendMu         sync.RWMutex
+	stopped        atomic.Bool
+	redirectTarget atomic.Pointer[Portal]
+	stop           chan struct{}
+	stopOnce       sync.Once
+	loopDone       chan struct{}
 
 	roomCreateLock   sync.Mutex
 	messageDedup     map[string]SentMessage
@@ -465,19 +472,139 @@ func (portal *Portal) MarkEncrypted() {
 }
 
 func (portal *Portal) ReceiveMatrixEvent(_ bridge.User, evt *event.Event) {
-	select {
-	case portal.MatrixMessages <- evt:
-	case <-portal.stop:
+	if !portal.enqueueMatrixEvent(evt) {
 		portal.log.Debugfln("Dropping Matrix event %s for stopped portal", evt.ID)
 	}
 }
 
 func (portal *Portal) stopLoop() {
+	portal.stopLoopInto(nil)
+}
+
+func (portal *Portal) stopLoopInto(target *Portal) {
 	portal.stopOnce.Do(func() {
+		if target != nil && target != portal {
+			portal.redirectTarget.Store(target)
+		}
+		portal.stopped.Store(true)
 		if portal.stop != nil {
 			close(portal.stop)
 		}
 	})
+}
+
+func (portal *Portal) resolveRedirectTarget() *Portal {
+	cur := portal.redirectTarget.Load()
+	for cur != nil {
+		next := cur.redirectTarget.Load()
+		if next == nil || next == cur {
+			break
+		}
+		cur = next
+	}
+	return cur
+}
+
+// enqueueMessage synchronizes admission to portal.Messages with handleMessageLoop
+// shutdown so no accepted send can occur after the loop's final drain.
+func (portal *Portal) enqueueMessage(msg *imessage.Message, timeout time.Duration) (enqueued bool, stopped bool) {
+	portal.sendMu.RLock()
+	defer portal.sendMu.RUnlock()
+	if portal.stopped.Load() {
+		return false, true
+	}
+	select {
+	case portal.Messages <- msg:
+		return true, false
+	default:
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-portal.stop:
+		return false, true
+	case portal.Messages <- msg:
+		return true, false
+	case <-timer.C:
+		return false, false
+	}
+}
+
+func (portal *Portal) enqueueMessageStatus(status *imessage.SendMessageStatus, timeout time.Duration) (enqueued bool, stopped bool) {
+	portal.sendMu.RLock()
+	defer portal.sendMu.RUnlock()
+	if portal.stopped.Load() {
+		return false, true
+	}
+	select {
+	case portal.MessageStatuses <- status:
+		return true, false
+	default:
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-portal.stop:
+		return false, true
+	case portal.MessageStatuses <- status:
+		return true, false
+	case <-timer.C:
+		return false, false
+	}
+}
+
+func (portal *Portal) enqueueReadReceipt(rr *imessage.ReadReceipt, timeout time.Duration) (enqueued bool, stopped bool) {
+	portal.sendMu.RLock()
+	defer portal.sendMu.RUnlock()
+	if portal.stopped.Load() {
+		return false, true
+	}
+	select {
+	case portal.ReadReceipts <- rr:
+		return true, false
+	default:
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-portal.stop:
+		return false, true
+	case portal.ReadReceipts <- rr:
+		return true, false
+	case <-timer.C:
+		return false, false
+	}
+}
+
+func (portal *Portal) enqueueMatrixEvent(evt *event.Event) bool {
+	portal.sendMu.RLock()
+	defer portal.sendMu.RUnlock()
+	if portal.stopped.Load() {
+		return false
+	}
+	select {
+	case portal.MatrixMessages <- evt:
+		return true
+	case <-portal.stop:
+		return false
+	}
+}
+
+func (portal *Portal) handleDrainedMessage(msg *imessage.Message, target *Portal) {
+	if target != nil {
+		if resolved := target.resolveRedirectTarget(); resolved != nil {
+			target = resolved
+		}
+		if len(target.MXID) > 0 {
+			if ok, _ := target.enqueueMessage(msg, PortalBufferTimeout); ok {
+				return
+			}
+		}
+	}
+	msg.CleanupTempAttachments()
+	if portal.bridge != nil && portal.bridge.IM != nil {
+		portal.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, "", false)
+	}
 }
 
 func (portal *Portal) removeSecondaryGUID(target string) {
@@ -705,19 +832,30 @@ func (portal *Portal) HandleiMessageReadReceipt(rr *imessage.ReadReceipt) {
 
 func (portal *Portal) handleMessageLoop() {
 	defer func() {
-		// Drain any remaining queued messages to avoid leaking temp attachment files.
+		// Wait for any in-flight enqueue callers to finish after portal.stop closed,
+		// then drain all accepted messages while holding sendMu.Lock so no new send
+		// can slip in after the drain.
+		portal.sendMu.Lock()
+		var drained []*imessage.Message
 		for {
 			select {
 			case msg := <-portal.Messages:
 				if msg != nil {
-					msg.CleanupTempAttachments()
+					drained = append(drained, msg)
 				}
 			default:
-				if portal.loopDone != nil {
-					close(portal.loopDone)
-				}
-				return
+				goto drainedAll
 			}
+		}
+	drainedAll:
+		target := portal.resolveRedirectTarget()
+		portal.sendMu.Unlock()
+
+		for _, msg := range drained {
+			portal.handleDrainedMessage(msg, target)
+		}
+		if portal.loopDone != nil {
+			close(portal.loopDone)
 		}
 	}()
 	for {
@@ -2919,9 +3057,7 @@ func (portal *Portal) HandleMatrixMeta(sender bridge.User, evt *event.Event) {
 	if !portal.canManageGroup() {
 		return
 	}
-	select {
-	case portal.MatrixMessages <- evt:
-	case <-portal.stop:
+	if !portal.enqueueMatrixEvent(evt) {
 		portal.log.Debugfln("Dropping Matrix meta event %s for stopped portal", evt.ID)
 	}
 }

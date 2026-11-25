@@ -65,6 +65,10 @@ const (
 	defaultEditKVCleanupInterval        = 24 * time.Hour
 	kvEditedPrefix                      = "bb_edit:"
 	maxTrackedEditedMessages            = 10000
+	// Set to the minimum upstream BlueBubbles Server version (e.g. "1.10.0") once
+	// BlueBubblesApp/bluebubbles-server updates its /api/v1/message/react validator
+	// to accept custom emoji reactions. Until then, outbound custom emoji reactions
+	// remain opt-in via imessage.bluebubbles_custom_emoji_reactions.
 	minCustomEmojiTapbacksServerVersion = ""
 )
 
@@ -280,48 +284,115 @@ func (bb *blueBubbles) customEmojiTapbacksConfigured() bool {
 	return bb.bridge != nil && bb.bridge.GetConnectorConfig() != nil && bb.bridge.GetConnectorConfig().BlueBubblesCustomEmojiReactions
 }
 
-func parseSemverParts(version string) ([3]int, bool) {
+type semverVersion struct {
+	core       [3]int
+	prerelease []string
+}
+
+func parseSemver(version string) (semverVersion, bool) {
 	v := strings.TrimSpace(version)
 	v = strings.TrimPrefix(strings.TrimPrefix(v, "v"), "V")
-	if idx := strings.IndexAny(v, "-+"); idx >= 0 {
+	if idx := strings.IndexByte(v, '+'); idx >= 0 {
+		v = v[:idx]
+	}
+	var prerelease []string
+	if idx := strings.IndexByte(v, '-'); idx >= 0 {
+		preStr := v[idx+1:]
+		if preStr == "" {
+			return semverVersion{}, false
+		}
+		prerelease = strings.Split(preStr, ".")
+		for _, id := range prerelease {
+			if id == "" {
+				return semverVersion{}, false
+			}
+		}
 		v = v[:idx]
 	}
 	if v == "" {
-		return [3]int{}, false
+		return semverVersion{}, false
 	}
 	rawParts := strings.Split(v, ".")
 	if len(rawParts) == 0 || len(rawParts) > 3 {
-		return [3]int{}, false
+		return semverVersion{}, false
 	}
-	var out [3]int
+	var out semverVersion
+	out.prerelease = prerelease
 	for i, part := range rawParts {
 		n, err := strconv.Atoi(part)
 		if err != nil || n < 0 {
-			return [3]int{}, false
+			return semverVersion{}, false
 		}
-		out[i] = n
+		out.core[i] = n
 	}
 	return out, true
+}
+
+func compareSemverPrerelease(a, b []string) int {
+	if len(a) == 0 && len(b) == 0 {
+		return 0
+	}
+	// Under SemVer 2.0.0, a normal release has higher precedence than a prerelease.
+	if len(a) == 0 {
+		return 1
+	}
+	if len(b) == 0 {
+		return -1
+	}
+	limit := len(a)
+	if len(b) < limit {
+		limit = len(b)
+	}
+	for i := 0; i < limit; i++ {
+		if a[i] == b[i] {
+			continue
+		}
+		an, aErr := strconv.Atoi(a[i])
+		bn, bErr := strconv.Atoi(b[i])
+		switch {
+		case aErr == nil && bErr == nil:
+			if an > bn {
+				return 1
+			}
+			return -1
+		case aErr == nil:
+			// Numeric identifiers always have lower precedence than non-numeric identifiers.
+			return -1
+		case bErr == nil:
+			return 1
+		case a[i] > b[i]:
+			return 1
+		default:
+			return -1
+		}
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	if len(a) < len(b) {
+		return -1
+	}
+	return 0
 }
 
 func serverVersionAtLeast(serverVersion, minVersion string) bool {
 	if minVersion == "" {
 		return false
 	}
-	got, ok := parseSemverParts(serverVersion)
+	got, ok := parseSemver(serverVersion)
 	if !ok {
 		return false
 	}
-	want, ok := parseSemverParts(minVersion)
+	want, ok := parseSemver(minVersion)
 	if !ok {
 		return false
 	}
 	for i := 0; i < 3; i++ {
-		if got[i] != want[i] {
-			return got[i] > want[i]
+		if got.core[i] != want.core[i] {
+			return got.core[i] > want.core[i]
 		}
 	}
-	return true
+	return compareSemverPrerelease(got.prerelease, want.prerelease) >= 0
 }
 
 func (bb *blueBubbles) applyServerInfo(info ServerInfo) {
@@ -885,6 +956,7 @@ func (bb *blueBubbles) getChatsWithActivityAfter(since, editLookback time.Time) 
 	// still discovering quiet chats whose pre-window LastMessage was recently
 	// edited or retracted.
 	stopBefore := since.Add(-scanWindow)
+	// Defensive guard in case catchUpChatScanWindow is configured shorter than editLookback.
 	if editLookback.Before(stopBefore) {
 		stopBefore = editLookback
 	}
@@ -1140,6 +1212,16 @@ func (bb *blueBubbles) shouldDownloadEditAttachments(attachmentCount int) bool {
 
 func (bb *blueBubbles) isNewEdit(guid string, dateEdited int64) bool {
 	if guid == "" || dateEdited == 0 {
+		return false
+	}
+	// Ignore edits older than the persisted edit KV TTL so read/delivery updates
+	// on historical edited messages whose bb_edit: row was pruned do not re-bridge
+	// duplicate edits to Matrix.
+	ttl := bb.editKVTTL
+	if ttl <= 0 {
+		ttl = defaultEditKVTTL
+	}
+	if dateEdited < time.Now().Add(-ttl).UnixMilli() {
 		return false
 	}
 	bb.editedLock.Lock()

@@ -208,17 +208,30 @@ func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
 			return
 		}
 	}
-	select {
-	case portal.Messages <- msg:
-	case <-portal.stop:
+	if ok, stopped := portal.enqueueMessage(msg, PortalBufferTimeout); ok {
+		return
+	} else if stopped {
+		// Portal was merged or replaced while this message was in flight; try its
+		// redirect target or a live replacement portal for the same chat GUID once.
+		nextPortal := portal.resolveRedirectTarget()
+		if nextPortal == nil {
+			if fresh := imh.bridge.GetPortalByGUIDIfExists(msg.ChatGUID); fresh != nil && fresh != portal {
+				nextPortal = fresh
+			}
+		}
+		if nextPortal != nil && nextPortal != portal && len(nextPortal.MXID) > 0 {
+			if ok2, _ := nextPortal.enqueueMessage(msg, PortalBufferTimeout); ok2 {
+				return
+			}
+		}
 		imh.log.Debugfln("Portal %s stopped before message %s could be queued", portal.GUID, msg.GUID)
 		msg.CleanupTempAttachments()
 		imh.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, "", false)
-	case <-time.After(PortalBufferTimeout):
-		imh.log.Errorln("Portal message buffer is still full after 10 seconds, dropping message %s", msg.GUID)
-		msg.CleanupTempAttachments()
-		imh.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, "", false)
+		return
 	}
+	imh.log.Errorln("Portal message buffer is still full after 10 seconds, dropping message %s", msg.GUID)
+	msg.CleanupTempAttachments()
+	imh.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, "", false)
 }
 
 func (imh *iMessageHandler) HandleMessageStatus(status *imessage.SendMessageStatus) {
@@ -227,12 +240,21 @@ func (imh *iMessageHandler) HandleMessageStatus(status *imessage.SendMessageStat
 		imh.log.Debugfln("Ignoring message status for message from unknown portal %s/%s", status.GUID, status.ChatGUID)
 		return
 	}
-	select {
-	case portal.MessageStatuses <- status:
-	case <-portal.stop:
-	case <-time.After(PortalBufferTimeout):
-		imh.log.Errorln("Portal message status buffer is still full after 10 seconds, dropping %+v", *status)
+	if ok, stopped := portal.enqueueMessageStatus(status, PortalBufferTimeout); ok {
+		return
+	} else if stopped {
+		nextPortal := portal.resolveRedirectTarget()
+		if nextPortal == nil {
+			if fresh := imh.bridge.GetPortalByGUIDIfExists(status.ChatGUID); fresh != nil && fresh != portal {
+				nextPortal = fresh
+			}
+		}
+		if nextPortal != nil && nextPortal != portal && len(nextPortal.MXID) > 0 {
+			_, _ = nextPortal.enqueueMessageStatus(status, PortalBufferTimeout)
+		}
+		return
 	}
+	imh.log.Errorln("Portal message status buffer is still full after 10 seconds, dropping %+v", *status)
 }
 
 func (imh *iMessageHandler) HandleReadReceipt(rr *imessage.ReadReceipt) {
@@ -241,12 +263,21 @@ func (imh *iMessageHandler) HandleReadReceipt(rr *imessage.ReadReceipt) {
 		imh.log.Debugfln("Ignoring read receipt in unknown portal %s", rr.ChatGUID)
 		return
 	}
-	select {
-	case portal.ReadReceipts <- rr:
-	case <-portal.stop:
-	case <-time.After(PortalBufferTimeout):
-		imh.log.Errorln("Portal read receipt buffer is still full after 10 seconds, dropping %+v", *rr)
+	if ok, stopped := portal.enqueueReadReceipt(rr, PortalBufferTimeout); ok {
+		return
+	} else if stopped {
+		nextPortal := portal.resolveRedirectTarget()
+		if nextPortal == nil {
+			if fresh := imh.bridge.GetPortalByGUIDIfExists(rr.ChatGUID); fresh != nil && fresh != portal {
+				nextPortal = fresh
+			}
+		}
+		if nextPortal != nil && nextPortal != portal && len(nextPortal.MXID) > 0 {
+			_, _ = nextPortal.enqueueReadReceipt(rr, PortalBufferTimeout)
+		}
+		return
 	}
+	imh.log.Errorln("Portal read receipt buffer is still full after 10 seconds, dropping %+v", *rr)
 }
 
 func (imh *iMessageHandler) HandleTypingNotification(notif *imessage.TypingNotification) {

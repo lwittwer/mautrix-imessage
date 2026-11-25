@@ -180,13 +180,14 @@ func (portal *Portal) Update(txn dbutil.Execable) {
 	}
 }
 
-func (portal *Portal) ReID(newGUID string) {
+func (portal *Portal) ReID(newGUID string) error {
 	_, err := portal.db.Exec("UPDATE portal SET guid=$1 WHERE guid=$2", newGUID, portal.GUID)
 	if err != nil {
 		portal.log.Warnfln("Failed to re-id %s: %v", portal.GUID, err)
-	} else {
-		portal.GUID = newGUID
+		return err
 	}
+	portal.GUID = newGUID
+	return nil
 }
 
 func (portal *Portal) Delete() {
