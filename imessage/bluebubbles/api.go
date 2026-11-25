@@ -58,10 +58,14 @@ const (
 	defaultContactRefreshInterval = 1 * time.Hour
 	defaultPendingEditTTL         = 60 * time.Second
 	defaultPendingGroupActionTTL  = 60 * time.Second
-	defaultCatchUpExtraMargin     = 30 * time.Second
-	defaultEditRetractLookback    = 20 * time.Minute
-	kvEditedPrefix                = "bb_edit:"
-	maxTrackedEditedMessages      = 10000
+	defaultCatchUpExtraMargin           = 30 * time.Second
+	defaultEditRetractLookback          = 20 * time.Minute
+	defaultCatchUpChatScanWindow        = 24 * time.Hour
+	defaultEditKVTTL                    = 30 * 24 * time.Hour
+	defaultEditKVCleanupInterval        = 24 * time.Hour
+	kvEditedPrefix                      = "bb_edit:"
+	maxTrackedEditedMessages            = 10000
+	minCustomEmojiTapbacksServerVersion = ""
 )
 
 type pendingEdit struct {
@@ -143,14 +147,18 @@ type blueBubbles struct {
 	lastCatchUpMsgs   int
 	lastCatchUpErr    string
 
-	catchUpMu      sync.Mutex
-	catchUpOverlap time.Duration
+	catchUpMu             sync.Mutex
+	catchUpOverlap        time.Duration
+	catchUpChatScanWindow time.Duration
+
+	editKVTTL             time.Duration
+	editKVCleanupInterval time.Duration
 
 	usingPrivateAPI atomic.Bool
-	// Outbound custom emoji tapbacks are intentionally gated off by default as
-	// groundwork until upstream BlueBubbles Server's /api/v1/message/react
-	// validator accepts custom emoji. Inbound 2006/3006 custom emoji reactions
-	// remain active regardless of this flag.
+	// Outbound custom emoji tapbacks are gated off by default until upstream
+	// BlueBubbles Server's /api/v1/message/react validator accepts custom emoji
+	// (or explicitly enabled via imessage.bluebubbles_custom_emoji_reactions).
+	// Inbound 2006/3006 custom emoji reactions remain active regardless of this flag.
 	supportsCustomEmojiTapbacks atomic.Bool
 }
 
@@ -185,13 +193,17 @@ func NewBlueBubblesConnector(bridge imessage.Bridge) (imessage.API, error) {
 		resolvedHandleServices: make(map[string]string),
 		chatServices:           make(map[string]string),
 
-		reconnectBaseDelay: defaultReconnectBaseDelay,
-		reconnectMaxDelay:  defaultReconnectMaxDelay,
+		reconnectBaseDelay:    defaultReconnectBaseDelay,
+		reconnectMaxDelay:     defaultReconnectMaxDelay,
+		catchUpChatScanWindow: defaultCatchUpChatScanWindow,
+		editKVTTL:             defaultEditKVTTL,
+		editKVCleanupInterval: defaultEditKVCleanupInterval,
 
 		ctx:    ctx,
 		cancel: cancel,
 	}
 	bb.wsReadTimeout.Store(int64(defaultWSReadTimeout))
+	bb.supportsCustomEmojiTapbacks.Store(bb.customEmojiTapbacksConfigured())
 	return bb, nil
 }
 
@@ -264,8 +276,59 @@ func (bb *blueBubbles) refreshPrivateAPI() {
 	bb.applyServerInfo(info)
 }
 
+func (bb *blueBubbles) customEmojiTapbacksConfigured() bool {
+	return bb.bridge != nil && bb.bridge.GetConnectorConfig() != nil && bb.bridge.GetConnectorConfig().BlueBubblesCustomEmojiReactions
+}
+
+func parseSemverParts(version string) ([3]int, bool) {
+	v := strings.TrimSpace(version)
+	v = strings.TrimPrefix(strings.TrimPrefix(v, "v"), "V")
+	if idx := strings.IndexAny(v, "-+"); idx >= 0 {
+		v = v[:idx]
+	}
+	if v == "" {
+		return [3]int{}, false
+	}
+	rawParts := strings.Split(v, ".")
+	if len(rawParts) == 0 || len(rawParts) > 3 {
+		return [3]int{}, false
+	}
+	var out [3]int
+	for i, part := range rawParts {
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 0 {
+			return [3]int{}, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+func serverVersionAtLeast(serverVersion, minVersion string) bool {
+	if minVersion == "" {
+		return false
+	}
+	got, ok := parseSemverParts(serverVersion)
+	if !ok {
+		return false
+	}
+	want, ok := parseSemverParts(minVersion)
+	if !ok {
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		if got[i] != want[i] {
+			return got[i] > want[i]
+		}
+	}
+	return true
+}
+
 func (bb *blueBubbles) applyServerInfo(info ServerInfo) {
 	bb.usingPrivateAPI.Store(info.PrivateAPI)
+	bb.supportsCustomEmojiTapbacks.Store(
+		bb.customEmojiTapbacksConfigured() || serverVersionAtLeast(info.ServerVersion, minCustomEmojiTapbacksServerVersion),
+	)
 	bb.healthMu.Lock()
 	bb.serverInfo = info
 	bb.hasServerInfo = true
@@ -359,6 +422,7 @@ func (bb *blueBubbles) Start(readyCallback func()) error {
 
 	go bb.wsLoop()
 	go bb.contactRefreshLoop()
+	go bb.editKVCleanupLoop()
 
 	// Notify main this API is fully loaded
 	readyCallback()
@@ -393,6 +457,58 @@ func (bb *blueBubbles) contactRefreshLoop() {
 			if err := bb.RefreshContactList(); err != nil {
 				bb.log.Warn().Err(err).Msg("Failed to periodically refresh contacts from BlueBubbles")
 			}
+		}
+	}
+}
+
+func (bb *blueBubbles) pruneExpiredEditTimestamps(now time.Time) {
+	ttl := bb.editKVTTL
+	if ttl <= 0 {
+		ttl = defaultEditKVTTL
+	}
+	cutoffMs := now.Add(-ttl).UnixMilli()
+
+	bb.editedLock.Lock()
+	for guid, ts := range bb.lastEdited {
+		if ts < cutoffMs {
+			delete(bb.lastEdited, guid)
+		}
+	}
+	bb.editedLock.Unlock()
+
+	kv, ok := bb.bridge.(imessage.KVStore)
+	if !ok || kv == nil {
+		return
+	}
+	deleted, err := kv.DeleteKVPrefixOlderThan(kvEditedPrefix, cutoffMs)
+	if err != nil {
+		bb.log.Warn().Err(err).Int64("cutoffMs", cutoffMs).Msg("Failed to prune expired persisted BlueBubbles edit timestamps")
+		return
+	}
+	if deleted > 0 {
+		bb.log.Debug().Int64("deleted", deleted).Int64("cutoffMs", cutoffMs).Msg("Pruned expired persisted BlueBubbles edit timestamps")
+	}
+}
+
+func (bb *blueBubbles) editKVCleanupLoop() {
+	if bb.context().Err() != nil {
+		return
+	}
+	bb.pruneExpiredEditTimestamps(time.Now())
+
+	interval := bb.editKVCleanupInterval
+	if interval <= 0 {
+		interval = defaultEditKVCleanupInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-bb.context().Done():
+			return
+		case now := <-ticker.C:
+			bb.pruneExpiredEditTimestamps(now)
 		}
 	}
 }
@@ -759,7 +875,20 @@ func (bb *blueBubbles) getChatsWithActivityAfter(since, editLookback time.Time) 
 		},
 		Sort: QuerySortLastMessage,
 	}
-	chats, err := bb.queryChats(request, []Chat{})
+	scanWindow := bb.catchUpChatScanWindow
+	if scanWindow <= 0 {
+		scanWindow = defaultCatchUpChatScanWindow
+	}
+	// Stop paginating once LastMessage.DateCreated falls past the scan window
+	// (generously wider than Apple's edit/unsend windows and editLookback) so
+	// reconnect catch-up avoids scanning full historical chat archives while
+	// still discovering quiet chats whose pre-window LastMessage was recently
+	// edited or retracted.
+	stopBefore := since.Add(-scanWindow)
+	if editLookback.Before(stopBefore) {
+		stopBefore = editLookback
+	}
+	chats, err := bb.queryChatsWithStop(request, []Chat{}, stopBefore.UnixMilli())
 	if err != nil {
 		return nil, err
 	}

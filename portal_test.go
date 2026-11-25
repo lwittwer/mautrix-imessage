@@ -965,3 +965,209 @@ func TestOverlappingDMMigrationsPreserveRoomMapping(t *testing.T) {
 		t.Fatalf("expected DB alias for iMessage;-;+15559990000 with original room, got %+v", row)
 	}
 }
+
+func TestReIDIntoAliasingScopedToSequoiaAny(t *testing.T) {
+	rawDB, err := dbutil.NewWithDialect("file:reid_scope_test?mode=memory&cache=shared&_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	defer rawDB.Close()
+
+	db := database.New(rawDB, log.DefaultLogger)
+	if err := db.Upgrade(); err != nil {
+		t.Fatalf("database upgrade failed: %v", err)
+	}
+
+	newBridge := func() *IMBridge {
+		zlog := zerolog.Nop()
+		b := &IMBridge{
+			DB:            db,
+			Config:        &config.Config{BaseConfig: &bridgeconfig.BaseConfig{}},
+			portalsByGUID: make(map[string]*Portal),
+			portalsByMXID: make(map[id.RoomID]*Portal),
+			IM:            &fakeTestIMAPI{},
+		}
+		b.Log = log.DefaultLogger
+		b.ZLog = &zlog
+		return b
+	}
+
+	// 1. Non-Sequoia private-chat re-ID (e.g. legacy mac/iOS ReIDPortal or DisableSMSPortals toggle)
+	//    must NOT keep the old GUID aliased in portalsByGUID or merged_chat.
+	br1 := newBridge()
+	legacyRow := db.Portal.New()
+	legacyRow.GUID = "iMessage;-;+15550001111"
+	legacyRow.Insert(nil)
+
+	legacyPortal := br1.GetPortalByGUID("iMessage;-;+15550001111")
+	defer legacyPortal.stopLoop()
+	if !br1.ReIDPortal("iMessage;-;+15550001111", "SMS;-;+15550001111", false) {
+		t.Fatal("expected legacy ReIDPortal to succeed")
+	}
+	if _, stillAliased := br1.portalsByGUID["iMessage;-;+15550001111"]; stillAliased {
+		t.Fatal("expected old GUID not to remain aliased in portalsByGUID for non-Sequoia re-ID")
+	}
+	if br1.portalsByGUID["SMS;-;+15550001111"] != legacyPortal {
+		t.Fatal("expected new GUID to map to portal in portalsByGUID")
+	}
+	// Reload from SQLite: new GUID resolves, old GUID does NOT resolve.
+	if row := db.Portal.GetByGUID("SMS;-;+15550001111"); row == nil || row.GUID != "SMS;-;+15550001111" {
+		t.Fatalf("expected DB lookup for new GUID SMS;-;+15550001111 to succeed, got %+v", row)
+	}
+	if row := db.Portal.GetByGUID("iMessage;-;+15550001111"); row != nil {
+		t.Fatalf("expected old GUID iMessage;-;+15550001111 not to remain aliased in merged_chat, got %+v", row)
+	}
+
+	// 2. Sequoia "any;-;" migration MUST preserve the old GUID alias in both memory and merged_chat.
+	seqRow := db.Portal.New()
+	seqRow.GUID = "iMessage;-;+15550002222"
+	seqRow.Insert(nil)
+
+	seqPortal := br1.GetPortalByGUID("iMessage;-;+15550002222")
+	defer seqPortal.stopLoop()
+	if !seqPortal.reIDInto("any;-;+15550002222", nil, true, false) {
+		t.Fatal("expected Sequoia any;-; reIDInto to succeed")
+	}
+	if br1.portalsByGUID["iMessage;-;+15550002222"] != seqPortal || br1.portalsByGUID["any;-;+15550002222"] != seqPortal {
+		t.Fatal("expected Sequoia any;-; migration to keep both old and new GUIDs in portalsByGUID")
+	}
+	if row := db.Portal.GetByGUID("any;-;+15550002222"); row == nil || row.GUID != "any;-;+15550002222" {
+		t.Fatalf("expected DB lookup for any;-;+15550002222 to succeed, got %+v", row)
+	}
+	if row := db.Portal.GetByGUID("iMessage;-;+15550002222"); row == nil || row.GUID != "any;-;+15550002222" {
+		t.Fatalf("expected DB alias for iMessage;-;+15550002222 -> any;-;+15550002222, got %+v", row)
+	}
+}
+
+func TestDeletedAndReplacedPortalsStopMessageLoop(t *testing.T) {
+	rawDB, err := dbutil.NewWithDialect("file:portal_stop_loop_test?mode=memory&cache=shared&_foreign_keys=on", "sqlite3")
+	if err != nil {
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	defer rawDB.Close()
+
+	db := database.New(rawDB, log.DefaultLogger)
+	if err := db.Upgrade(); err != nil {
+		t.Fatalf("database upgrade failed: %v", err)
+	}
+
+	zlog := zerolog.Nop()
+	br := &IMBridge{
+		DB:            db,
+		Config:        &config.Config{BaseConfig: &bridgeconfig.BaseConfig{}},
+		portalsByGUID: make(map[string]*Portal),
+		portalsByMXID: make(map[id.RoomID]*Portal),
+		user:          &User{User: &database.User{MXID: "@me:example.com"}},
+		IM:            &fakeTestIMAPI{},
+	}
+	br.Log = log.DefaultLogger
+	br.ZLog = &zlog
+
+	// 1. Direct Delete() stops handleMessageLoop cleanly and is idempotent.
+	p1 := br.GetPortalByGUID("iMessage;-;+15553000001")
+	p1.Delete()
+	select {
+	case <-p1.loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("deleted portal handleMessageLoop did not exit cleanly")
+	}
+	// Second Delete() must not panic (sync.Once protects close(portal.stop)).
+	p1.Delete()
+	// Sending an event after stop must not block even when MatrixMessages buffer is full.
+	for i := 0; i < cap(p1.MatrixMessages)+5; i++ {
+		p1.ReceiveMatrixEvent(nil, &event.Event{ID: id.EventID("$evt")})
+	}
+
+	// 2. ReIDPortal replacing an empty target portal stops the replaced target's loop,
+	//    while the surviving portal's loop continues running.
+	mxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"event_id":"$state-evt"}`))
+	}))
+	defer mxSrv.Close()
+
+	as := appservice.Create()
+	as.HomeserverDomain = "example.com"
+	as.Registration = &appservice.Registration{AppToken: "token"}
+	as.StateStore.MarkRegistered("@imessage_15553000002:example.com")
+	as.StateStore.SetMembership("!room-src:example.com", "@imessage_15553000002:example.com", event.MembershipJoin)
+	mxClient, err := mautrix.NewClient(mxSrv.URL, "@imessage_15553000002:example.com", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	puppetIntent := as.NewIntentAPI("imessage_15553000002")
+	puppetIntent.Client = mxClient
+	puppetIntent.UserID = "@imessage_15553000002:example.com"
+	puppetIntent.IsCustomPuppet = true
+	br.Bot = &appservice.IntentAPI{UserID: "@bot:example.com"}
+	br.puppets = map[string]*Puppet{
+		"+15553000002": {
+			Puppet: &database.Puppet{ID: "+15553000002"},
+			bridge: br,
+			MXID:   "@imessage_15553000002:example.com",
+			Intent: puppetIntent,
+		},
+	}
+
+	sourceDB := db.Portal.New()
+	sourceDB.GUID = "iMessage;-;+15553000002"
+	sourceDB.MXID = "!room-src:example.com"
+	sourceDB.Insert(nil)
+
+	emptyTargetDB := db.Portal.New()
+	emptyTargetDB.GUID = "SMS;-;+15553000002"
+	emptyTargetDB.Insert(nil)
+
+	sourcePortal := br.GetPortalByGUID("iMessage;-;+15553000002")
+	defer sourcePortal.stopLoop()
+	emptyTargetPortal := br.GetPortalByGUID("SMS;-;+15553000002")
+
+	if !br.ReIDPortal("iMessage;-;+15553000002", "SMS;-;+15553000002", false) {
+		t.Fatal("expected ReIDPortal replacing empty target portal to succeed")
+	}
+	select {
+	case <-emptyTargetPortal.loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("replaced empty target portal handleMessageLoop did not exit cleanly")
+	}
+	select {
+	case <-sourcePortal.loopDone:
+		t.Fatal("surviving re-ID'd portal handleMessageLoop should still be running")
+	default:
+	}
+
+	// 3. ReIDPortal where old portal has no room and target portal already exists:
+	//    old portal is deleted and its message loop MUST stop, while target stays alive.
+	oldNoRoom := br.GetPortalByGUID("iMessage;-;+15553000003")
+	existingTarget := br.GetPortalByGUID("SMS;-;+15553000003")
+	defer existingTarget.stopLoop()
+
+	if br.ReIDPortal("iMessage;-;+15553000003", "SMS;-;+15553000003", false) {
+		t.Fatal("expected ReIDPortal to return false when target already exists and old portal is nuked")
+	}
+	select {
+	case <-oldNoRoom.loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("nuked old portal handleMessageLoop did not exit cleanly")
+	}
+	select {
+	case <-existingTarget.loopDone:
+		t.Fatal("surviving target portal handleMessageLoop should still be running")
+	default:
+	}
+
+	// 4. Verify secondary GUID deletion removes key from portalsByGUID (doesn't leave nil entry).
+	pSec := br.GetPortalByGUID("any;-;+15553000004")
+	pSec.addSecondaryGUIDs([]string{"iMessage;-;+15553000004"})
+	br.portalsLock.Lock()
+	br.portalsByGUID["iMessage;-;+15553000004"] = pSec
+	br.portalsLock.Unlock()
+	pSec.Delete()
+	select {
+	case <-pSec.loopDone:
+	case <-time.After(time.Second):
+		t.Fatal("deleted portal with secondary GUID did not stop its loop")
+	}
+	if _, exists := br.portalsByGUID["iMessage;-;+15553000004"]; exists {
+		t.Fatal("expected deleted secondary GUID to be removed from portalsByGUID instead of set to nil")
+	}
+}

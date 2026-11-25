@@ -153,11 +153,25 @@ func (portal *Portal) reIDInto(newGUID string, newPortal *Portal, lock, mergeExi
 	portal.log = portal.bridge.Log.Sub(fmt.Sprintf("Portal/%s", portal.GUID))
 	br.portalsByGUID[portal.GUID] = portal
 	if portal.IsPrivateChat() {
+		// Scope old-GUID aliasing to Sequoia "any;-;" migrations so legacy mac/iOS
+		// ReIDPortal and DisableSMSPortals toggles don't leave stale aliases behind,
+		// while still maintaining the new GUID's self-mapping row in merged_chat.
+		keepOldAlias := portal.Identifier.Service == "any"
 		if br.DB != nil && br.DB.MergedChat != nil {
-			br.DB.MergedChat.Set(nil, portal.GUID, portal.GUID, oldGUID)
+			if keepOldAlias {
+				br.DB.MergedChat.Set(nil, portal.GUID, portal.GUID, oldGUID)
+			} else {
+				br.DB.MergedChat.Set(nil, portal.GUID, portal.GUID)
+				br.DB.MergedChat.Remove(oldGUID)
+			}
 		}
-		br.portalsByGUID[oldGUID] = portal
-		portal.addSecondaryGUIDs([]string{oldGUID})
+		if keepOldAlias {
+			br.portalsByGUID[oldGUID] = portal
+			portal.addSecondaryGUIDs([]string{portal.GUID, oldGUID})
+		} else {
+			portal.removeSecondaryGUID(oldGUID)
+			portal.addSecondaryGUIDs([]string{portal.GUID})
+		}
 	}
 	if portal.Identifier.Service == "any" && oldService != "" && oldService != "any" {
 		portal.serviceLock.Lock()
@@ -307,6 +321,8 @@ func (br *IMBridge) NewPortal(dbPortal *database.Portal) *Portal {
 		MessageStatuses: make(chan *imessage.SendMessageStatus, 100),
 		MatrixMessages:  make(chan *event.Event, 100),
 		backfillStart:   make(chan struct{}),
+		stop:            make(chan struct{}),
+		loopDone:        make(chan struct{}),
 	}
 	portal.log = maulogadapt.ZeroAsMau(&portal.zlog)
 	if portal.Identifier.Service == "any" && br.DB != nil && br.DB.KV != nil {
@@ -347,6 +363,10 @@ type Portal struct {
 	backfillStart   chan struct{}
 	backfillWait    sync.WaitGroup
 	backfillLock    sync.Mutex
+
+	stop     chan struct{}
+	stopOnce sync.Once
+	loopDone chan struct{}
 
 	roomCreateLock   sync.Mutex
 	messageDedup     map[string]SentMessage
@@ -445,7 +465,29 @@ func (portal *Portal) MarkEncrypted() {
 }
 
 func (portal *Portal) ReceiveMatrixEvent(_ bridge.User, evt *event.Event) {
-	portal.MatrixMessages <- evt
+	select {
+	case portal.MatrixMessages <- evt:
+	case <-portal.stop:
+		portal.log.Debugfln("Dropping Matrix event %s for stopped portal", evt.ID)
+	}
+}
+
+func (portal *Portal) stopLoop() {
+	portal.stopOnce.Do(func() {
+		if portal.stop != nil {
+			close(portal.stop)
+		}
+	})
+}
+
+func (portal *Portal) removeSecondaryGUID(target string) {
+	filtered := portal.SecondaryGUIDs[:0]
+	for _, guid := range portal.SecondaryGUIDs {
+		if guid != target {
+			filtered = append(filtered, guid)
+		}
+	}
+	portal.SecondaryGUIDs = filtered
 }
 
 func (portal *Portal) addSecondaryGUIDs(guids []string) {
@@ -662,10 +704,33 @@ func (portal *Portal) HandleiMessageReadReceipt(rr *imessage.ReadReceipt) {
 }
 
 func (portal *Portal) handleMessageLoop() {
+	defer func() {
+		// Drain any remaining queued messages to avoid leaking temp attachment files.
+		for {
+			select {
+			case msg := <-portal.Messages:
+				if msg != nil {
+					msg.CleanupTempAttachments()
+				}
+			default:
+				if portal.loopDone != nil {
+					close(portal.loopDone)
+				}
+				return
+			}
+		}
+	}()
 	for {
+		select {
+		case <-portal.stop:
+			return
+		default:
+		}
 		var start time.Time
 		var thing string
 		select {
+		case <-portal.stop:
+			return
 		case msg := <-portal.Messages:
 			start = time.Now()
 			thing = "iMessage"
@@ -2730,12 +2795,13 @@ func (portal *Portal) unlockedDelete() {
 	delete(portal.bridge.portalsByGUID, portal.GUID)
 	for _, guid := range portal.SecondaryGUIDs {
 		if storedPortal := portal.bridge.portalsByGUID[guid]; storedPortal == portal {
-			portal.bridge.portalsByGUID[guid] = nil
+			delete(portal.bridge.portalsByGUID, guid)
 		}
 	}
 	if len(portal.MXID) > 0 {
 		delete(portal.bridge.portalsByMXID, portal.MXID)
 	}
+	portal.stopLoop()
 }
 
 func (portal *Portal) GetMatrixUsers() ([]id.UserID, error) {
@@ -2853,7 +2919,11 @@ func (portal *Portal) HandleMatrixMeta(sender bridge.User, evt *event.Event) {
 	if !portal.canManageGroup() {
 		return
 	}
-	portal.MatrixMessages <- evt
+	select {
+	case portal.MatrixMessages <- evt:
+	case <-portal.stop:
+		portal.log.Debugfln("Dropping Matrix meta event %s for stopped portal", evt.ID)
+	}
 }
 
 func (portal *Portal) handleMatrixMetaEvent(evt *event.Event) {

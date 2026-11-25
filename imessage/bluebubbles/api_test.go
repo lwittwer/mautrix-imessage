@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,6 +88,25 @@ func (f *fakeBridge) DeleteKV(key string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.kv, key)
+}
+func (f *fakeBridge) DeleteKVPrefixOlderThan(prefix string, cutoff int64) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var deleted int64
+	for k, v := range f.kv {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		ts, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			continue
+		}
+		if ts < cutoff {
+			delete(f.kv, k)
+			deleted++
+		}
+	}
+	return deleted, nil
 }
 func (f *fakeBridge) IsCaptionInMessage() bool {
 	return f.captionInMessage
@@ -2194,5 +2214,226 @@ func TestAckingEditADoesNotPersistQueuedEditB(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected unacknowledged edit B to remain retryable after restart")
+	}
+}
+
+func TestCustomEmojiTapbacksConfigAndServerVersionHelper(t *testing.T) {
+	var gotReactions []SendReactionRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/server/info":
+			_ = json.NewEncoder(w).Encode(ServerInfoResponse{
+				Status: 200,
+				Data:   ServerInfo{ServerVersion: "1.9.7", PrivateAPI: true},
+			})
+		case "/api/v1/message/react":
+			var req SendReactionRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			gotReactions = append(gotReactions, req)
+			_ = json.NewEncoder(w).Encode(SendReactionResponse{
+				Status: 200,
+				Data:   Message{GUID: "react-1", DateCreated: 1700000000000},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	// Default config: gated off even after applyServerInfo with Private API enabled.
+	bbDefault, _ := newTestConnector(t, srv.URL)
+	bbDefault.refreshPrivateAPI()
+	if bbDefault.Capabilities().SendCustomEmojiTapbacks {
+		t.Fatal("expected SendCustomEmojiTapbacks to stay false by default after applyServerInfo")
+	}
+
+	// Explicit config opt-in: enabled when Private API is true, disabled when Private API is false.
+	fb := newFakeBridge(srv.URL, "secret-pw")
+	fb.cfg.BlueBubblesCustomEmojiReactions = true
+	apiOptIn, err := NewBlueBubblesConnector(fb)
+	if err != nil {
+		t.Fatalf("NewBlueBubblesConnector failed: %v", err)
+	}
+	bbOptIn := apiOptIn.(*blueBubbles)
+	if bbOptIn.Capabilities().SendCustomEmojiTapbacks {
+		t.Fatal("expected SendCustomEmojiTapbacks to require Private API even when opted in")
+	}
+	bbOptIn.refreshPrivateAPI()
+	if !bbOptIn.Capabilities().SendCustomEmojiTapbacks {
+		t.Fatal("expected SendCustomEmojiTapbacks to be true when opted in and Private API is active")
+	}
+	if _, err := bbOptIn.SendCustomEmojiTapback("iMessage;-;+15551234567", "msg-1", 0, "🎉", false); err != nil {
+		t.Fatalf("SendCustomEmojiTapback failed: %v", err)
+	}
+	if len(gotReactions) != 1 || gotReactions[0].Reaction != "🎉" {
+		t.Fatalf("unexpected custom emoji reaction request: %+v", gotReactions)
+	}
+
+	// Verify semver comparison helper behavior for future server_version auto-detection.
+	if serverVersionAtLeast("1.9.7", "") {
+		t.Fatal("empty minVersion must always return false")
+	}
+	if !serverVersionAtLeast("v1.10.0-beta.1", "1.10.0") {
+		t.Fatal("expected v1.10.0-beta.1 >= 1.10.0")
+	}
+	if !serverVersionAtLeast("2.0", "1.10.5") {
+		t.Fatal("expected 2.0 >= 1.10.5")
+	}
+	if serverVersionAtLeast("1.9.9", "1.10.0") {
+		t.Fatal("expected 1.9.9 < 1.10.0")
+	}
+	if serverVersionAtLeast("invalid", "1.0.0") {
+		t.Fatal("expected invalid version to return false")
+	}
+}
+
+func TestReconnectCatchUpEarlyStopBoundsChatPagination(t *testing.T) {
+	now := time.Now()
+	since := now.Add(-2 * time.Minute)
+	editLookback := since.Add(-defaultEditRetractLookback)
+
+	var pagesRequested []int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/chat/query" {
+			http.NotFound(w, r)
+			return
+		}
+		var req ChatQueryRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		pagesRequested = append(pagesRequested, req.Offset)
+
+		switch req.Offset {
+		case 0:
+			// Page 1: active recent chat + quiet chat 1h ago (both within 24h scan window -> fetch page 2)
+			_ = json.NewEncoder(w).Encode(ChatQueryResponse{
+				Status: 200,
+				Data: []Chat{
+					{
+						GUID:        "iMessage;-;+15550000001",
+						LastMessage: &Message{GUID: "m-recent", DateCreated: now.Add(-30 * time.Second).UnixMilli()},
+					},
+					{
+						GUID:        "iMessage;-;+15550000002",
+						LastMessage: &Message{GUID: "m-quiet-untouched", DateCreated: now.Add(-1 * time.Hour).UnixMilli()},
+					},
+				},
+				Metadata: PageMetadata{Total: 6, Limit: 2, Offset: 0, Count: 2},
+			})
+		case 2:
+			// Page 2: quiet chat created 2h ago whose LastMessage was retracted during disconnect,
+			// followed by an old chat created 48h ago (past 24h scan window -> early stop!).
+			_ = json.NewEncoder(w).Encode(ChatQueryResponse{
+				Status: 200,
+				Data: []Chat{
+					{
+						GUID: "iMessage;-;+15550000003",
+						LastMessage: &Message{
+							GUID:          "m-2h-retracted",
+							DateCreated:   now.Add(-2 * time.Hour).UnixMilli(),
+							DateRetracted: now.Add(-10 * time.Second).UnixMilli(),
+						},
+					},
+					{
+						GUID:        "iMessage;-;+15550000004",
+						LastMessage: &Message{GUID: "m-48h-old", DateCreated: now.Add(-48 * time.Hour).UnixMilli()},
+					},
+				},
+				Metadata: PageMetadata{Total: 6, Limit: 2, Offset: 2, Count: 2},
+			})
+		default:
+			t.Errorf("early stop failed: requested historical chat page at offset=%d", req.Offset)
+			http.Error(w, "should have stopped paginating", http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	bb, _ := newTestConnector(t, srv.URL)
+	active, err := bb.getChatsWithActivityAfter(since, editLookback)
+	if err != nil {
+		t.Fatalf("getChatsWithActivityAfter failed: %v", err)
+	}
+	if len(pagesRequested) != 2 || pagesRequested[0] != 0 || pagesRequested[1] != 2 {
+		t.Fatalf("expected exactly 2 chat pages [0, 2], got %v", pagesRequested)
+	}
+	if len(active) != 2 {
+		t.Fatalf("expected 2 active chats (recent + 2h-old retracted quiet chat), got %d: %+v", len(active), active)
+	}
+	if active[0].GUID != "iMessage;-;+15550000001" || active[1].GUID != "iMessage;-;+15550000003" {
+		t.Fatalf("unexpected active chats: %+v", active)
+	}
+}
+
+func TestEditKVCleanupPrunesExpiredEntries(t *testing.T) {
+	fb := newFakeBridge("http://localhost:1234", "secret-pw")
+	api, err := NewBlueBubblesConnector(fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bb := api.(*blueBubbles)
+	bb.editKVTTL = 7 * 24 * time.Hour
+	bb.editKVCleanupInterval = 20 * time.Millisecond
+
+	now := time.Now()
+	expiredTS := now.Add(-10 * 24 * time.Hour).UnixMilli()
+	freshTS := now.Add(-2 * 24 * time.Hour).UnixMilli()
+
+	bb.markEdited("msg-expired", expiredTS)
+	bb.markEdited("msg-fresh", freshTS)
+	fb.SetKV("unrelated_key", strconv.FormatInt(expiredTS, 10))
+
+	// Run cleanup loop briefly and verify both initial cleanup and clean shutdown on Stop().
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bb.editKVCleanupLoop()
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if fb.GetKV(kvEditedPrefix+"msg-expired") == "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if got := fb.GetKV(kvEditedPrefix + "msg-expired"); got != "" {
+		t.Fatalf("expected expired bb_edit KV entry to be pruned, got %q", got)
+	}
+	if got := fb.GetKV(kvEditedPrefix + "msg-fresh"); got != strconv.FormatInt(freshTS, 10) {
+		t.Fatalf("expected fresh bb_edit KV entry to remain, got %q", got)
+	}
+	if got := fb.GetKV("unrelated_key"); got != strconv.FormatInt(expiredTS, 10) {
+		t.Fatalf("expected unrelated KV entry to remain untouched, got %q", got)
+	}
+
+	bb.editedLock.Lock()
+	_, expiredInMem := bb.lastEdited["msg-expired"]
+	freshInMemTS := bb.lastEdited["msg-fresh"]
+	bb.editedLock.Unlock()
+	if expiredInMem {
+		t.Fatal("expected expired entry to also be pruned from in-memory lastEdited")
+	}
+	if freshInMemTS != freshTS {
+		t.Fatalf("expected fresh in-memory lastEdited entry %d, got %d", freshTS, freshInMemTS)
+	}
+
+	// Verify periodic tick prunes an entry added after loop startup.
+	bb.markEdited("msg-expired-later", expiredTS)
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if fb.GetKV(kvEditedPrefix+"msg-expired-later") == "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := fb.GetKV(kvEditedPrefix + "msg-expired-later"); got != "" {
+		t.Fatalf("expected periodic tick to prune msg-expired-later, got %q", got)
+	}
+
+	bb.Stop()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("editKVCleanupLoop did not exit cleanly on Stop()")
 	}
 }

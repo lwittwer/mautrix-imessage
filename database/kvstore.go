@@ -20,6 +20,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	log "maunium.net/go/maulogger/v2"
 )
@@ -64,4 +66,79 @@ func (kvq *KeyValueQuery) Delete(key string) {
 	if err != nil {
 		panic(fmt.Errorf("failed to delete %s: %w", key, err))
 	}
+}
+
+func escapeLikePrefix(prefix string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(prefix) + "%"
+}
+
+// DeletePrefixOlderThan deletes all kv_store rows whose key starts with prefix
+// and whose value parses as a base-10 int64 strictly less than cutoff.
+func (kvq *KeyValueQuery) DeletePrefixOlderThan(prefix string, cutoff int64) (int64, error) {
+	if prefix == "" {
+		return 0, errors.New("prefix must not be empty")
+	}
+
+	rows, err := kvq.db.Query("SELECT key, value FROM kv_store WHERE key LIKE $1 ESCAPE '\\'", escapeLikePrefix(prefix))
+	if err != nil {
+		return 0, fmt.Errorf("failed to query kv_store for prefix %s: %w", prefix, err)
+	}
+
+	var expiredKeys []string
+	for rows.Next() {
+		var key, raw string
+		if err := rows.Scan(&key, &raw); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("failed to scan kv_store row for prefix %s: %w", prefix, err)
+		}
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		ts, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil {
+			continue
+		}
+		if ts < cutoff {
+			expiredKeys = append(expiredKeys, key)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("failed iterating kv_store rows for prefix %s: %w", prefix, err)
+	}
+	_ = rows.Close()
+
+	if len(expiredKeys) == 0 {
+		return 0, nil
+	}
+
+	const batchSize = 200
+	var deleted int64
+	for start := 0; start < len(expiredKeys); start += batchSize {
+		end := start + batchSize
+		if end > len(expiredKeys) {
+			end = len(expiredKeys)
+		}
+		batch := expiredKeys[start:end]
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, key := range batch {
+			placeholders[i] = fmt.Sprintf("$%d", i+1)
+			args[i] = key
+		}
+		res, execErr := kvq.db.Exec(
+			fmt.Sprintf("DELETE FROM kv_store WHERE key IN (%s)", strings.Join(placeholders, ", ")),
+			args...,
+		)
+		if execErr != nil {
+			return deleted, fmt.Errorf("failed to delete expired kv_store rows for prefix %s: %w", prefix, execErr)
+		}
+		if n, raErr := res.RowsAffected(); raErr == nil {
+			deleted += n
+		} else {
+			deleted += int64(len(batch))
+		}
+	}
+	return deleted, nil
 }

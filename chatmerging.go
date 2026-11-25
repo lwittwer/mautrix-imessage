@@ -165,6 +165,11 @@ func (portal *Portal) Merge(others []*Portal) {
 	if err != nil {
 		portal.log.Errorln("Failed to commit room merge transaction:", err)
 	} else {
+		for _, other := range others {
+			if other != nil && other != portal {
+				other.stopLoop()
+			}
+		}
 		portal.log.Infofln("Finished merging %v -> %s / %v -> %s", guids, portal.GUID, roomIDs, newRoomID)
 		if newRoomID != "" {
 			portal.addToSpace(portal.bridge.user)

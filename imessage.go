@@ -210,6 +210,10 @@ func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
 	}
 	select {
 	case portal.Messages <- msg:
+	case <-portal.stop:
+		imh.log.Debugfln("Portal %s stopped before message %s could be queued", portal.GUID, msg.GUID)
+		msg.CleanupTempAttachments()
+		imh.bridge.IM.SendMessageBridgeResult(msg.ChatGUID, msg.GUID, "", false)
 	case <-time.After(PortalBufferTimeout):
 		imh.log.Errorln("Portal message buffer is still full after 10 seconds, dropping message %s", msg.GUID)
 		msg.CleanupTempAttachments()
@@ -225,6 +229,7 @@ func (imh *iMessageHandler) HandleMessageStatus(status *imessage.SendMessageStat
 	}
 	select {
 	case portal.MessageStatuses <- status:
+	case <-portal.stop:
 	case <-time.After(PortalBufferTimeout):
 		imh.log.Errorln("Portal message status buffer is still full after 10 seconds, dropping %+v", *status)
 	}
@@ -238,6 +243,7 @@ func (imh *iMessageHandler) HandleReadReceipt(rr *imessage.ReadReceipt) {
 	}
 	select {
 	case portal.ReadReceipts <- rr:
+	case <-portal.stop:
 	case <-time.After(PortalBufferTimeout):
 		imh.log.Errorln("Portal read receipt buffer is still full after 10 seconds, dropping %+v", *rr)
 	}
