@@ -91,6 +91,8 @@ func (imh *iMessageHandler) Start() {
 
 const PortalBufferTimeout = 10 * time.Second
 
+var portalBufferTimeout = PortalBufferTimeout
+
 func (imh *iMessageHandler) rerouteGroupMMS(portal *Portal, msg *imessage.Message) *Portal {
 	if !imh.bridge.Config.Bridge.RerouteSMSGroupReplies ||
 		!portal.Identifier.IsGroup ||
@@ -212,7 +214,7 @@ func (imh *iMessageHandler) handleMessage(msg *imessage.Message, retried bool) {
 			return
 		}
 	}
-	if ok, stopped := portal.enqueueMessage(msg, PortalBufferTimeout); ok {
+	if ok, stopped := portal.enqueueMessage(msg, portalBufferTimeout); ok {
 		return
 	} else if stopped {
 		if target := portal.resolveRedirectTarget(); target != nil && target != portal {
@@ -224,7 +226,7 @@ func (imh *iMessageHandler) handleMessage(msg *imessage.Message, retried bool) {
 					return
 				}
 			}
-			if ok2, _ := target.enqueueMessage(msg, PortalBufferTimeout); ok2 {
+			if ok2, _ := target.enqueueMessage(msg, portalBufferTimeout); ok2 {
 				return
 			}
 		} else if !retried {
@@ -254,11 +256,11 @@ func (imh *iMessageHandler) handleMessageStatus(status *imessage.SendMessageStat
 		imh.log.Debugfln("Ignoring message status for message from unknown portal %s/%s", status.GUID, status.ChatGUID)
 		return
 	}
-	if ok, stopped := portal.enqueueMessageStatus(status, PortalBufferTimeout); ok {
+	if ok, stopped := portal.enqueueMessageStatus(status, portalBufferTimeout); ok {
 		return
 	} else if stopped {
 		if target := portal.resolveRedirectTarget(); target != nil && target != portal && len(target.MXID) > 0 {
-			_, _ = target.enqueueMessageStatus(status, PortalBufferTimeout)
+			_, _ = target.enqueueMessageStatus(status, portalBufferTimeout)
 		} else if !retried {
 			imh.handleMessageStatus(status, true)
 		}
@@ -277,11 +279,11 @@ func (imh *iMessageHandler) handleReadReceipt(rr *imessage.ReadReceipt, retried 
 		imh.log.Debugfln("Ignoring read receipt in unknown portal %s", rr.ChatGUID)
 		return
 	}
-	if ok, stopped := portal.enqueueReadReceipt(rr, PortalBufferTimeout); ok {
+	if ok, stopped := portal.enqueueReadReceipt(rr, portalBufferTimeout); ok {
 		return
 	} else if stopped {
 		if target := portal.resolveRedirectTarget(); target != nil && target != portal && len(target.MXID) > 0 {
-			_, _ = target.enqueueReadReceipt(rr, PortalBufferTimeout)
+			_, _ = target.enqueueReadReceipt(rr, portalBufferTimeout)
 		} else if !retried {
 			imh.handleReadReceipt(rr, true)
 		}

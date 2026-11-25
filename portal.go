@@ -137,6 +137,8 @@ func (portal *Portal) reIDInto(newGUID string, newPortal *Portal, lock, mergeExi
 			replaceEmptyPortal = newPortal
 		} else {
 			br.Log.Warnfln("Got chat ID change %s->%s, but portal with new ID already exists. Nuking old portal and not changing ID", portal.GUID, newGUID)
+			newPortal.registerHandoff(portal)
+			portal.stopLoopInto(newPortal)
 			portal.unlockedDelete()
 			if len(portal.MXID) > 0 && portal.bridge.user.DoublePuppetIntent != nil {
 				_, _ = portal.bridge.user.DoublePuppetIntent.LeaveRoom(portal.MXID)
@@ -344,6 +346,7 @@ func (br *IMBridge) NewPortal(dbPortal *database.Portal) *Portal {
 
 		Identifier:      imessage.ParseIdentifier(dbPortal.GUID),
 		Messages:        make(chan *imessage.Message, 100),
+		handoffMessages: make(chan *imessage.Message, 100),
 		ReadReceipts:    make(chan *imessage.ReadReceipt, 100),
 		MessageStatuses: make(chan *imessage.SendMessageStatus, 100),
 		MatrixMessages:  make(chan *event.Event, 100),
@@ -384,6 +387,7 @@ type Portal struct {
 	SecondaryGUIDs []string
 
 	Messages        chan *imessage.Message
+	handoffMessages chan *imessage.Message
 	ReadReceipts    chan *imessage.ReadReceipt
 	MessageStatuses chan *imessage.SendMessageStatus
 	MatrixMessages  chan *event.Event
@@ -532,11 +536,32 @@ func (portal *Portal) resolveRedirectTarget() *Portal {
 	return cur
 }
 
-// registerHandoff records a retired portal's loopDone channel so new messages
-// routed to this survivor wait until the retired portal finishes forwarding its
-// buffered messages, preserving message/tapback ordering across a merge.
-func (portal *Portal) registerHandoff(done <-chan struct{}) {
-	if done == nil {
+// registerHandoff records a retired portal's loopDone channel (and any active
+// upstream handoff waiters it still holds, for chained merges A->B->C) so this
+// survivor's handleMessageLoop processes drained handoff messages before newer
+// messages from portal.Messages.
+func (portal *Portal) registerHandoff(other *Portal) {
+	if other == nil || other == portal {
+		return
+	}
+	var waiters []<-chan struct{}
+	other.handoffMu.Lock()
+	for _, ch := range other.handoffWaiters {
+		select {
+		case <-ch:
+		default:
+			waiters = append(waiters, ch)
+		}
+	}
+	other.handoffMu.Unlock()
+	if other.loopDone != nil {
+		select {
+		case <-other.loopDone:
+		default:
+			waiters = append(waiters, other.loopDone)
+		}
+	}
+	if len(waiters) == 0 {
 		return
 	}
 	portal.handoffMu.Lock()
@@ -548,36 +573,18 @@ func (portal *Portal) registerHandoff(done <-chan struct{}) {
 			kept = append(kept, ch)
 		}
 	}
-	kept = append(kept, done)
+	kept = append(kept, waiters...)
 	portal.handoffWaiters = kept
 	portal.activeHandoffs.Store(int32(len(kept)))
 	portal.handoffMu.Unlock()
 }
 
-func (portal *Portal) waitForHandoffs(timeout time.Duration) (ready bool, stopped bool) {
+func (portal *Portal) nextActiveHandoff() <-chan struct{} {
 	if portal.activeHandoffs.Load() == 0 {
-		return true, false
+		return nil
 	}
 	portal.handoffMu.Lock()
-	waiters := append([]<-chan struct{}(nil), portal.handoffWaiters...)
-	portal.handoffMu.Unlock()
-	if len(waiters) == 0 {
-		return true, false
-	}
-
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	for _, ch := range waiters {
-		select {
-		case <-ch:
-		case <-portal.stop:
-			return false, true
-		case <-timer.C:
-			return false, false
-		}
-	}
-
-	portal.handoffMu.Lock()
+	defer portal.handoffMu.Unlock()
 	kept := portal.handoffWaiters[:0]
 	for _, ch := range portal.handoffWaiters {
 		select {
@@ -588,28 +595,75 @@ func (portal *Portal) waitForHandoffs(timeout time.Duration) (ready bool, stoppe
 	}
 	portal.handoffWaiters = kept
 	portal.activeHandoffs.Store(int32(len(kept)))
-	portal.handoffMu.Unlock()
-	return true, false
+	if len(kept) == 0 {
+		return nil
+	}
+	return kept[0]
+}
+
+// waitHandoffsInLoop runs inside handleMessageLoop before processing a newer
+// message from portal.Messages, ensuring any in-progress merge handoffs finish
+// forwarding and delivering older messages first without timing out senders.
+func (portal *Portal) waitHandoffsInLoop() bool {
+	for {
+		waiter := portal.nextActiveHandoff()
+		if waiter == nil {
+			break
+		}
+		select {
+		case <-portal.stop:
+			return false
+		case hmsg := <-portal.handoffMessages:
+			if hmsg != nil {
+				portal.HandleiMessage(hmsg)
+			}
+		case <-waiter:
+		}
+	}
+	if portal.handoffMessages != nil {
+		for {
+			select {
+			case <-portal.stop:
+				return false
+			default:
+			}
+			select {
+			case <-portal.stop:
+				return false
+			case hmsg := <-portal.handoffMessages:
+				if hmsg != nil {
+					portal.HandleiMessage(hmsg)
+				}
+			default:
+				return true
+			}
+		}
+	}
+	return true
 }
 
 // enqueueMessage synchronizes admission to portal.Messages with handleMessageLoop
-// shutdown and any in-progress merge handoffs so no accepted send can occur after
-// the loop's final drain and post-merge messages cannot overtake drained ones.
+// shutdown so no accepted send can occur after the loop's final drain.
 func (portal *Portal) enqueueMessage(msg *imessage.Message, timeout time.Duration) (enqueued bool, stopped bool) {
-	if ok, st := portal.waitForHandoffs(timeout); !ok {
-		return false, st
-	}
-	return portal.enqueueMessageDirect(msg, timeout)
+	return portal.enqueueMessageTo(portal.Messages, msg, timeout)
 }
 
-func (portal *Portal) enqueueMessageDirect(msg *imessage.Message, timeout time.Duration) (enqueued bool, stopped bool) {
+func (portal *Portal) enqueueHandoffMessage(msg *imessage.Message, timeout time.Duration) (enqueued bool, stopped bool) {
+	ch := portal.handoffMessages
+	if ch == nil {
+		ch = portal.Messages
+	}
+	return portal.enqueueMessageTo(ch, msg, timeout)
+}
+
+func (portal *Portal) enqueueMessageTo(ch chan *imessage.Message, msg *imessage.Message, timeout time.Duration) (enqueued bool, stopped bool) {
 	portal.sendMu.RLock()
 	defer portal.sendMu.RUnlock()
 	if portal.stopped.Load() {
 		return false, true
 	}
 	select {
-	case portal.Messages <- msg:
+	case ch <- msg:
 		return true, false
 	default:
 	}
@@ -618,7 +672,7 @@ func (portal *Portal) enqueueMessageDirect(msg *imessage.Message, timeout time.D
 	select {
 	case <-portal.stop:
 		return false, true
-	case portal.Messages <- msg:
+	case ch <- msg:
 		return true, false
 	case <-timer.C:
 		return false, false
@@ -686,15 +740,25 @@ func (portal *Portal) enqueueMatrixEvent(evt *event.Event) bool {
 }
 
 func (portal *Portal) handleDrainedMessage(msg *imessage.Message, target *Portal) {
-	if target != nil {
+	for hops := 0; target != nil && hops < 8; hops++ {
 		if resolved := target.resolveRedirectTarget(); resolved != nil {
 			target = resolved
 		}
-		if len(target.MXID) > 0 {
-			if ok, _ := target.enqueueMessageDirect(msg, PortalBufferTimeout); ok {
-				return
-			}
+		if len(target.MXID) == 0 {
+			break
 		}
+		ok, stopped := target.enqueueHandoffMessage(msg, portalBufferTimeout)
+		if ok {
+			return
+		}
+		if !stopped {
+			break
+		}
+		next := target.resolveRedirectTarget()
+		if next == nil || next == target {
+			break
+		}
+		target = next
 	}
 	msg.CleanupTempAttachments()
 	if portal.bridge != nil && portal.bridge.IM != nil {
@@ -926,12 +990,30 @@ func (portal *Portal) HandleiMessageReadReceipt(rr *imessage.ReadReceipt) {
 }
 
 func (portal *Portal) handleMessageLoop() {
+	var pendingMsg *imessage.Message
 	defer func() {
 		// Wait for any in-flight enqueue callers to finish after portal.stop closed,
-		// then drain all accepted messages while holding sendMu.Lock so no new send
-		// can slip in after the drain.
+		// then drain handoffMessages, any interrupted pendingMsg, and Messages while
+		// holding sendMu.Lock so no new send can slip in after the drain.
 		portal.sendMu.Lock()
 		var drained []*imessage.Message
+		if portal.handoffMessages != nil {
+			for {
+				select {
+				case msg := <-portal.handoffMessages:
+					if msg != nil {
+						drained = append(drained, msg)
+					}
+				default:
+					goto drainedHandoffs
+				}
+			}
+		}
+	drainedHandoffs:
+		if pendingMsg != nil {
+			drained = append(drained, pendingMsg)
+			pendingMsg = nil
+		}
 		for {
 			select {
 			case msg := <-portal.Messages:
@@ -964,7 +1046,15 @@ func (portal *Portal) handleMessageLoop() {
 		select {
 		case <-portal.stop:
 			return
+		case msg := <-portal.handoffMessages:
+			start = time.Now()
+			thing = "handoff iMessage"
+			portal.HandleiMessage(msg)
 		case msg := <-portal.Messages:
+			if !portal.waitHandoffsInLoop() {
+				pendingMsg = msg
+				return
+			}
 			start = time.Now()
 			thing = "iMessage"
 			portal.HandleiMessage(msg)

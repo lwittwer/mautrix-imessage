@@ -1850,3 +1850,326 @@ func TestMergePreservesTargetBeforeTapbackOrdering(t *testing.T) {
 		t.Fatalf("expected second event to be m.reaction targeting $evt-1 in %s, got %+v", survivorRoom, second)
 	}
 }
+
+func TestMergeChainedAndSlowDrainPreserveTargetBeforeTapback(t *testing.T) {
+	type sentMatrixEvt struct {
+		roomID    id.RoomID
+		eventType string
+		relTarget id.EventID
+	}
+
+	setupBridge := func(t *testing.T, dbName string, rooms ...id.RoomID) (*IMBridge, *database.Database, *iMessageHandler, chan sentMatrixEvt, func()) {
+		t.Helper()
+		rawDB, err := dbutil.NewWithDialect(fmt.Sprintf("file:%s?mode=memory&cache=shared&_foreign_keys=on", dbName), "sqlite3")
+		if err != nil {
+			t.Fatalf("failed to open sqlite db: %v", err)
+		}
+		db := database.New(rawDB, log.DefaultLogger)
+		if err := db.Upgrade(); err != nil {
+			rawDB.Close()
+			t.Fatalf("database upgrade failed: %v", err)
+		}
+
+		sentEvts := make(chan sentMatrixEvt, 8)
+		var evtSeq atomic.Int32
+		mxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/send/") {
+				parts := strings.Split(r.URL.Path, "/")
+				var roomID id.RoomID
+				var evType string
+				for i, p := range parts {
+					if p == "rooms" && i+1 < len(parts) {
+						roomID = id.RoomID(parts[i+1])
+					}
+					if p == "send" && i+1 < len(parts) {
+						evType = parts[i+1]
+					}
+				}
+				var body struct {
+					RelatesTo struct {
+						EventID id.EventID `json:"event_id"`
+					} `json:"m.relates_to"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				eid := id.EventID(fmt.Sprintf("$evt-%d", evtSeq.Add(1)))
+				sentEvts <- sentMatrixEvt{roomID: roomID, eventType: evType, relTarget: body.RelatesTo.EventID}
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"event_id":%q}`, eid)))
+				return
+			}
+			_, _ = w.Write([]byte(`{}`))
+		}))
+
+		makeIntent := func(mxid id.UserID) *appservice.IntentAPI {
+			as := appservice.Create()
+			as.HomeserverDomain = "example.com"
+			as.Registration = &appservice.Registration{AppToken: "token"}
+			client, err := mautrix.NewClient(mxSrv.URL, mxid, "token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			intent := as.NewIntentAPI(mxid.Localpart())
+			intent.Client = client
+			intent.UserID = mxid
+			intent.IsCustomPuppet = true
+			as.StateStore.MarkRegistered(mxid)
+			for _, room := range rooms {
+				as.StateStore.SetMembership(room, mxid, event.MembershipJoin)
+			}
+			return intent
+		}
+
+		zlog := zerolog.Nop()
+		br := &IMBridge{
+			DB: db,
+			Config: &config.Config{
+				BaseConfig: &bridgeconfig.BaseConfig{
+					Homeserver: bridgeconfig.HomeserverConfig{Software: bridgeconfig.SoftwareStandard},
+				},
+			},
+			portalsByGUID: make(map[string]*Portal),
+			portalsByMXID: make(map[id.RoomID]*Portal),
+			puppets:       make(map[string]*Puppet),
+			user:          &User{User: &database.User{MXID: "@me:example.com"}},
+			IM:            &fakeTestIMAPI{},
+		}
+		br.Log = log.DefaultLogger
+		br.ZLog = &zlog
+		br.SpecVersions = mautrix.RespVersions{}
+		br.Bot = makeIntent("@bot:example.com")
+		for _, pid := range []string{"+15558000001", "a@example.com", "b@example.com"} {
+			mxid := id.UserID(fmt.Sprintf("@imessage_%s:example.com", strings.TrimPrefix(strings.ReplaceAll(pid, "@", "_"), "+")))
+			br.puppets[pid] = &Puppet{
+				Puppet: &database.Puppet{ID: pid, Displayname: pid},
+				bridge: br,
+				MXID:   mxid,
+				Intent: makeIntent(mxid),
+			}
+		}
+
+		cleanup := func() {
+			mxSrv.Close()
+			rawDB.Close()
+		}
+		return br, db, NewiMessageHandler(br), sentEvts, cleanup
+	}
+
+	t.Run("chained_merge", func(t *testing.T) {
+		roomA := id.RoomID("!chain-a:example.com")
+		roomB := id.RoomID("!chain-b:example.com")
+		roomC := id.RoomID("!chain-c:example.com")
+		br, db, imh, sentEvts, cleanup := setupBridge(t, "chained_merge_order_test", roomA, roomB, roomC)
+		defer cleanup()
+
+		for _, item := range []struct {
+			guid string
+			room id.RoomID
+		}{
+			{"iMessage;-;a@example.com", roomA},
+			{"iMessage;-;b@example.com", roomB},
+			{"iMessage;-;+15558000001", roomC},
+		} {
+			row := db.Portal.New()
+			row.GUID = item.guid
+			row.MXID = item.room
+			row.Insert(nil)
+		}
+
+		portalA := br.GetPortalByGUID("iMessage;-;a@example.com")
+		portalB := br.GetPortalByGUID("iMessage;-;b@example.com")
+		portalC := br.GetPortalByGUID("iMessage;-;+15558000001")
+		defer portalC.stopLoop()
+
+		unpauseA := pausePortalLoop(t, portalA)
+		if ok, _ := portalA.enqueueMessage(&imessage.Message{
+			GUID:     "chain-orig-1",
+			ChatGUID: portalA.GUID,
+			Sender:   imessage.Identifier{LocalID: "+15558000001", Service: "iMessage"},
+			Service:  "iMessage",
+			Text:     "chained original",
+			Time:     time.Now(),
+		}, time.Second); !ok {
+			t.Fatal("failed to queue original on portalA")
+		}
+
+		// Merge A -> B, then B -> C while A stays paused.
+		portalB.Merge([]*Portal{portalA})
+		portalC.Merge([]*Portal{portalB})
+		select {
+		case <-portalB.loopDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("portalB did not exit after merge into portalC")
+		}
+
+		// Submit tapback through updated route while A is STILL paused.
+		imh.HandleMessage(&imessage.Message{
+			GUID:     "chain-tb-1",
+			ChatGUID: portalA.GUID,
+			Sender:   imessage.Identifier{LocalID: "+15558000001", Service: "iMessage"},
+			Service:  "iMessage",
+			Time:     time.Now(),
+			Tapback: &imessage.Tapback{
+				TargetGUID: "chain-orig-1",
+				TargetPart: 0,
+				Type:       imessage.TapbackLike,
+			},
+		})
+
+		time.Sleep(25 * time.Millisecond)
+		unpauseA()
+		select {
+		case <-portalA.loopDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("portalA did not exit after unpause")
+		}
+
+		var first, second sentMatrixEvt
+		select {
+		case first = <-sentEvts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for chained original event")
+		}
+		select {
+		case second = <-sentEvts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for chained tapback event")
+		}
+		if first.roomID != roomC || first.eventType != "m.room.message" {
+			t.Fatalf("expected m.room.message in %s first, got %+v", roomC, first)
+		}
+		if second.roomID != roomC || second.eventType != "m.reaction" || second.relTarget != "$evt-1" {
+			t.Fatalf("expected m.reaction targeting $evt-1 in %s second, got %+v", roomC, second)
+		}
+	})
+
+	t.Run("slow_drain_past_timeout", func(t *testing.T) {
+		origTimeout := portalBufferTimeout
+		portalBufferTimeout = 80 * time.Millisecond
+		defer func() { portalBufferTimeout = origTimeout }()
+
+		roomA := id.RoomID("!slow-a:example.com")
+		roomB := id.RoomID("!slow-b:example.com")
+		br, db, imh, sentEvts, cleanup := setupBridge(t, "slow_drain_merge_test", roomA, roomB)
+		defer cleanup()
+
+		rowA := db.Portal.New()
+		rowA.GUID = "iMessage;-;a@example.com"
+		rowA.MXID = roomA
+		rowA.Insert(nil)
+
+		rowB := db.Portal.New()
+		rowB.GUID = "iMessage;-;+15558000001"
+		rowB.MXID = roomB
+		rowB.Insert(nil)
+
+		portalA := br.GetPortalByGUID(rowA.GUID)
+		portalB := br.GetPortalByGUID(rowB.GUID)
+		defer portalB.stopLoop()
+
+		unpauseA := pausePortalLoop(t, portalA)
+		if ok, _ := portalA.enqueueMessage(&imessage.Message{
+			GUID:     "slow-orig-1",
+			ChatGUID: portalA.GUID,
+			Sender:   imessage.Identifier{LocalID: "+15558000001", Service: "iMessage"},
+			Service:  "iMessage",
+			Text:     "slow original",
+			Time:     time.Now(),
+		}, time.Second); !ok {
+			t.Fatal("failed to queue original on portalA")
+		}
+
+		portalB.Merge([]*Portal{portalA})
+
+		// Submit tapback; must NOT block or time out even though portalA remains paused past portalBufferTimeout.
+		imh.HandleMessage(&imessage.Message{
+			GUID:     "slow-tb-1",
+			ChatGUID: portalA.GUID,
+			Sender:   imessage.Identifier{LocalID: "+15558000001", Service: "iMessage"},
+			Service:  "iMessage",
+			Time:     time.Now(),
+			Tapback: &imessage.Tapback{
+				TargetGUID: "slow-orig-1",
+				TargetPart: 0,
+				Type:       imessage.TapbackLove,
+			},
+		})
+
+		// Keep retired loop paused past portalBufferTimeout before releasing it.
+		time.Sleep(160 * time.Millisecond)
+		unpauseA()
+		select {
+		case <-portalA.loopDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("portalA did not exit after unpause")
+		}
+
+		var first, second sentMatrixEvt
+		select {
+		case first = <-sentEvts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for slow-drain original event")
+		}
+		select {
+		case second = <-sentEvts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for slow-drain tapback event")
+		}
+		if first.roomID != roomB || first.eventType != "m.room.message" {
+			t.Fatalf("expected m.room.message in %s first, got %+v", roomB, first)
+		}
+		if second.roomID != roomB || second.eventType != "m.reaction" || second.relTarget != "$evt-1" {
+			t.Fatalf("expected m.reaction targeting $evt-1 in %s second, got %+v", roomB, second)
+		}
+	})
+
+	t.Run("reid_nuked_old_portal_forwards_to_existing_target", func(t *testing.T) {
+		oldRoom := id.RoomID("!reid-old:example.com")
+		newRoom := id.RoomID("!reid-new:example.com")
+		br, db, _, sentEvts, cleanup := setupBridge(t, "reid_nuke_forward_test", oldRoom, newRoom)
+		defer cleanup()
+
+		oldRow := db.Portal.New()
+		oldRow.GUID = "iMessage;-;a@example.com"
+		oldRow.MXID = oldRoom
+		oldRow.Insert(nil)
+
+		newRow := db.Portal.New()
+		newRow.GUID = "iMessage;-;+15558000001"
+		newRow.MXID = newRoom
+		newRow.Insert(nil)
+
+		oldPortal := br.GetPortalByGUID(oldRow.GUID)
+		newPortal := br.GetPortalByGUID(newRow.GUID)
+		defer newPortal.stopLoop()
+
+		unpauseOld := pausePortalLoop(t, oldPortal)
+		if ok, _ := oldPortal.enqueueMessage(&imessage.Message{
+			GUID:     "reid-queued-1",
+			ChatGUID: oldPortal.GUID,
+			Sender:   imessage.Identifier{LocalID: "+15558000001", Service: "iMessage"},
+			Service:  "iMessage",
+			Text:     "queued before reid nuke",
+			Time:     time.Now(),
+		}, time.Second); !ok {
+			t.Fatal("failed to queue message on oldPortal")
+		}
+
+		if br.ReIDPortal(oldRow.GUID, newRow.GUID, false) {
+			t.Fatal("expected ReIDPortal to return false when nuking old portal in favor of existing target")
+		}
+		unpauseOld()
+		select {
+		case <-oldPortal.loopDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("oldPortal did not stop after being nuked in ReIDPortal")
+		}
+
+		select {
+		case evt := <-sentEvts:
+			if evt.roomID != newRoom || evt.eventType != "m.room.message" {
+				t.Fatalf("expected queued message to be forwarded to %s, got %+v", newRoom, evt)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for queued message to be forwarded to existing target portal")
+		}
+	})
+}

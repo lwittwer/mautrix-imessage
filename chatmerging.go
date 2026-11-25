@@ -172,7 +172,7 @@ func (portal *Portal) Merge(others []*Portal) {
 				}
 				// Register handoff before releasing portalsLock so new messages routed
 				// to portal wait for other's buffered messages to be forwarded first.
-				portal.registerHandoff(other.loopDone)
+				portal.registerHandoff(other)
 				other.stopLoopInto(portal)
 			}
 		}
